@@ -45,6 +45,7 @@ NO_SEND = os.path.expanduser("~/.ccs-no-send")  # folders whose files the bot ne
 # what a task hands over as a result: documents, tables, archives, image files (charts); sent with the report
 DELIVERABLE = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|odt|ods|odp|csv|zip|epub|png|jpe?g|gif|webp)$", re.I)
 SKIP_DIRS = {"node_modules", "dist", "build", "target", "coverage", "venv", "__pycache__"}  # plus hidden folders
+USER_DIRS = {"Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public"}  # in home
 SECRET = re.compile(r"^\.env(\..+)?$|^id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key|p12|pfx|jks|keystore|sql|dump|sqlite3?|db)(\.gz)?$"
                     r"|secret|credential|passw", re.I)
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -1170,7 +1171,11 @@ def made_files(s, reply, max_dirs=3000):
     for m in re.finditer(r"[\w./~-]+\.[A-Za-z0-9]{2,5}\b", reply or ""):
         path = os.path.expanduser(m.group())
         consider(path if os.path.isabs(path) else os.path.join(cwd or "", path))
-    for n, (root, dirs, files) in enumerate(os.walk(cwd) if cwd else []):
+    real, home = os.path.realpath(cwd or "/"), os.path.realpath(os.path.expanduser("~"))
+    # other apps save files into home, the folders above it and ~/Desktop, ~/Downloads…: never scan those
+    shared = (home + os.sep).startswith(real.rstrip(os.sep) + os.sep) or \
+        (os.path.dirname(real) == home and os.path.basename(real) in USER_DIRS)
+    for n, (root, dirs, files) in enumerate(os.walk(cwd) if cwd and not shared else []):
         if n >= max_dirs:  # a huge tree: what the reply names still counts
             break
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -1242,9 +1247,12 @@ def approve(ev):
     cfg, tool, inp = kc_get(TG, "bot"), ev.get("tool_name") or "a tool", ev.get("tool_input") or {}
     if tool == "AskUserQuestion" or not (cfg and cfg.get("chat")) or private(ev.get("cwd")) or idle() < 60:
         return None
-    detail = inp.get("command") or inp.get("file_path") or inp.get("url") or json.dumps(inp, ensure_ascii=False, indent=1)
+    # a command or URL as is; any other tool its whole input, so a Write shows its content and an Edit its change
+    detail = inp.get("command") or inp.get("url") or json.dumps(inp, ensure_ascii=False, indent=1)
+    if len(detail) > 3500:  # never offer Allow for what the phone can't show in full (Telegram: 4096 characters)
+        return None
     text = (f"🔐 <b>{esc(project(ev))}</b> · Claude asks to use <b>{esc(tool)}</b>"
-            + (f"\n{esc(inp['description'])}" if inp.get("description") else "") + f"\n<pre>{esc(shorten(detail, 1500))}</pre>")
+            + (f"\n{esc(shorten(inp['description'], 300))}" if inp.get("description") else "") + f"\n<pre>{esc(detail)}</pre>")
     qid = secrets.token_hex(4)
     sent = tg(cfg, "sendMessage", chat_id=cfg["chat"], text=text, parse_mode="HTML",
               reply_markup={"inline_keyboard": [[{"text": "✅ Allow", "callback_data": f"pa:{qid}"},

