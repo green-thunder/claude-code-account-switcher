@@ -1,32 +1,60 @@
-# ccs — Claude Code account switcher
+<p align="center">
+  <img src="docs/hero.jpg" width="900" alt="ccs: three Claude Code accounts with their usage bars in the terminal, the CCS Usage menu bar popover, and a permission request answered on the phone">
+</p>
 
-For macOS. Keeps several Claude Code accounts, shows each one's **5-hour (5h)** and **7-day (7d)** limits, and switches between them manually or automatically.
+<p align="center">
+  <b>All your Claude Code accounts on one Mac.</b><br>
+  See every 5-hour and weekly limit, switch in one click, and let it switch for you before a limit stops your work.
+</p>
 
-- **Terminal:** `ccs` lists every account with its usage.
-- **Menu bar app (CCS Usage):** shows `5% · 24%`. Click it for a popover with usage cards and a **Switch** button for each other account.
-- **Auto (LaunchAgent):** checks every 2 minutes. At 90% it asks before switching, and at 95% it switches by itself.
-- **Telegram bot:** see usage, switch accounts, and answer the 90% question from your phone.
-- **Phone alerts:** a Telegram report when Claude finishes a task, with its screenshots, and a message when it's waiting for you.
-- **Status line:** the terminal `claude` shows which account is active.
+<p align="center">
+  <img alt="macOS 14+" src="https://img.shields.io/badge/macOS-14%2B-161B26?logo=apple&logoColor=white">
+  <img alt="Python 3.9+, standard library only" src="https://img.shields.io/badge/python-3.9%2B%20%C2%B7%20no%20dependencies-161B26?logo=python&logoColor=white">
+  <img alt="Menu bar app in SwiftUI" src="https://img.shields.io/badge/menu%20bar-SwiftUI-161B26?logo=swift&logoColor=white">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-32D74B"></a>
+</p>
 
-## Files
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#menu-bar-app">Menu bar</a> ·
+  <a href="#auto-switching">Auto-switch</a> ·
+  <a href="#telegram">Telegram</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
-| File | Purpose | Installed to |
-|---|---|---|
-| `ccs` | main script (Python, standard library only) | `~/.local/bin/ccs` |
-| `menubar/` | the menu bar app (SwiftUI): `CCSUsage.swift`, `Info.plist`, `build.sh` | `~/Applications/CCS Usage.app` |
-| `uz.ccs.auto.plist` | auto-switch agent | `~/Library/LaunchAgents/` |
-| `uz.ccs.telegram.plist` | Telegram bot (always running) | `~/Library/LaunchAgents/` |
-| `uz.ccs.menubar.plist` | starts the menu bar app at login | `~/Library/LaunchAgents/` |
-| `test_ccs.py` | test (never touches your real login) | — |
+---
 
-`ccs` keeps its data in these places:
+Claude Code is signed in to one account at a time. If you have a team seat and a personal plan, that means `/login` round trips, and you only find out an account is spent when it stops you mid-task. **ccs** keeps every login in the macOS Keychain, reads each account's usage, and swaps the active login in a second.
 
-- **Tokens:** the macOS Keychain, in items named `ccs-account` (never in a plain file); the Telegram bot token is in `ccs-telegram`
-- **Account list:** `~/.claude-accounts.json`
-- **Usage cache and "Not now" answers:** `~/.claude-accounts-usage.json`
-- **Usage history** (chart and forecasts): `~/.claude-accounts-history.jsonl`
-- **Auto log:** `~/.claude-accounts.log`
+## At a glance
+
+| | |
+|---|---|
+| 🖥 **Terminal** | `ccs` lists every account with its limits; `ccs use 2` switches. |
+| 📊 **Menu bar** | The active account's `42% · 63%` at all times. Click for usage cards with pace markers, a 24-hour history chart and a **Switch** button per account. |
+| ⚡ **Auto-switch** | Checks every 2 minutes. At 90% it asks, at 95% it moves you to the least-used account. |
+| 📱 **Telegram** | Usage and switching from your phone. While you're away from the Mac, Claude's permission prompts and questions come to the phone with buttons. |
+| 🔔 **Alerts** | A report with screenshots and files when a task finishes, a forecast before a limit runs out, and a warning when usage rises while nothing on your Mac is using Claude. |
+| 🔒 **Careful with secrets** | Tokens live only in the Keychain. `.env` files, keys and the folders you list never leave the Mac. |
+| 🪶 **Small** | One Python file with no dependencies, one SwiftUI file, and tests that never touch your real login. |
+
+## How it works
+
+```mermaid
+flowchart LR
+    T["ccs in the terminal"] --> C{{"ccs"}}
+    M["CCS Usage<br/>menu bar app"] -->|"ccs json · ccs use N"| C
+    A["auto agent<br/>launchd, every 2 min"] -->|"ccs auto --once"| C
+    H["Claude Code hooks"] -->|"ccs hook"| C
+    C <-->|"swaps the login"| L[("Claude Code login<br/>Keychain + ~/.claude.json")]
+    C <-->|"one item per account"| K[("Keychain<br/>ccs-account")]
+    C -->|"reads usage"| U["Anthropic usage endpoint"]
+    C <-->|"long polling, no server"| B["Telegram bot"]
+    B <--> P(["your phone"])
+```
+
+`ccs` is the only program that touches the Claude Code login. The menu bar app, the auto agent, the hooks and the bot all go through it.
 
 ## Install
 
@@ -80,12 +108,11 @@ sed "s|__HOME__|$HOME|g" uz.ccs.telegram.plist > ~/Library/LaunchAgents/uz.ccs.t
 | `ccs tg setup` / `ccs tg` | connect the Telegram bot / run it (the LaunchAgent does this) |
 | `ccs hook` | the Claude Code hook behind the phone alerts |
 
-What `ccs` looks like:
-```
-● 1  you@example.com   Team · Max 5x
-     5h        █░░░░░░░░░  11%   ↻ 4h05m
-     7d        ████░░░░░░  36%   ↻ 4d23h
-```
+What `ccs` looks like (`●` = active account, `↻` = time until that limit resets):
+
+<img src="docs/terminal.png" width="520" alt="ccs listing three accounts, each with 5h and 7d usage bars colored green, orange or red, and the time until each limit resets">
+
+The colors are the same everywhere: green below 70%, orange from 70%, red from 90%.
 
 ## Auto-switching
 
@@ -114,6 +141,17 @@ tail -f ~/.claude-accounts.log
 
 **CCS Usage** is a small native app (SwiftUI) whose look follows [Claude-Usage-Tracker](https://github.com/hamed-elfayome/Claude-Usage-Tracker) (MIT). Its data and its switching come from `ccs` (`ccs json`, `ccs use N`), so `ccs` stays the only program that touches the Claude Code login.
 
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="docs/popover.png" width="300" alt="The popover on a normal day: session usage 42%, weekly 63%, a 24-hour history chart and two other accounts with Switch buttons"></td>
+    <td align="center" width="50%"><img src="docs/popover-near-limit.png" width="300" alt="The popover near a limit: session usage 93% in red, weekly 81% in orange"></td>
+  </tr>
+  <tr>
+    <td align="center">A normal day</td>
+    <td align="center">Near a limit: at 95% auto-switch moves you on</td>
+  </tr>
+</table>
+
 - **Menu bar:** a gauge and the active account's 5h · 7d usage, e.g. `5% · 24%`.
 - **Popover header:** the active account's name. Tap it for a menu of all accounts, and pick one to switch. ⟳ refreshes. ⚙ has **Devices & sessions on claude.ai…**, which opens Settings → Account, where claude.ai lists every device signed in to the account and lets you sign one out (there's no API for this, so the app can't show it itself); **Claude Code tokens on claude.ai…**, which opens Settings → Claude Code, where users report that Claude Code logins and `claude setup-token` tokens (valid for a year) are listed and can be revoked one by one; and **Quit**. Careful there: the logins `ccs` saved for your accounts are Claude Code logins too, so revoking those means `/login` again for that account.
 - **Cards:** one per limit of the active account: **Session Usage** (5-hour rolling window), **All models** (weekly), and the weekly Sonnet/Opus limits when the account has them. Each card shows:
@@ -133,7 +171,7 @@ To check the look without opening the menu bar, draw the popover with live data 
 ```bash
 "$HOME/Applications/CCS Usage.app/Contents/MacOS/CCSUsage" --snapshot ~/Desktop/popover.png
 ```
-Add `--data some.json` (a saved or edited `ccs json` output) to draw it with other numbers, e.g. to see how 95% or a full week of history looks. In that picture the dropdown menus and the 24h/7d switch show up as yellow boxes, because macOS can't draw them offscreen. They look normal in the real menu bar.
+Add `--data some.json` (a saved or edited `ccs json` output) to draw it with other numbers, e.g. to see how 95% or a full week of history looks. The screenshots in this README were made that way, with made-up accounts.
 
 ## Telegram
 
@@ -241,9 +279,9 @@ To turn phone alerts off, remove the `Stop` and `Notification` entries. Sessions
 
 ## Permission requests on the phone
 
-When Claude asks for permission (to run a command, edit a file…) while you're away from the Mac (no keyboard or mouse input for 60 seconds), the request comes to the phone with the full command and **✅ Allow** / **⛔ Deny** buttons. Your tap goes back to Claude Code as your answer. **Deny** tells Claude "Denied from the phone".
+When Claude asks for permission (to run a command, edit a file…) while you're away from the Mac (no keyboard or mouse input for 60 seconds), the request comes to the phone with the full command (for other tools, their whole input: a file write shows the content, an edit shows the change) and **✅ Allow** / **⛔ Deny** buttons. Your tap goes back to Claude Code as your answer. **Deny** tells Claude "Denied from the phone".
 
-- **At the Mac, or in a `~/.ccs-no-send` folder:** asked on the Mac as usual. The phone still gets the "waiting for you" heads-up.
+- **At the Mac, in a `~/.ccs-no-send` folder, or too long to show in full on the phone (over 3,500 characters):** asked on the Mac as usual. The phone still gets the "waiting for you" heads-up.
 - **Back at the Mac first, or no answer within 25 minutes:** the request moves to the Mac; the phone message says so.
 - **Read the command before you tap Allow:** it runs with that session's full rights.
 
@@ -300,7 +338,7 @@ Opus 5.5 · effort high · context left 72%
 
 **Documents a task produced come with its report automatically**: PDF, Word, Excel, PowerPoint, OpenDocument, CSV, ZIP, EPUB, and image files such as charts (images as photos). This covers files made by a script (`python make_report.py`, pandoc, a headless browser…), not just ones written with Claude's file tool. A file counts when it changed during that task, and it is either:
 
-- **inside the project**, skipping hidden folders and `node_modules`, `dist`, `build`, `target`, `coverage`, `venv`, `__pycache__`; or
+- **inside the project**, skipping hidden folders and `node_modules`, `dist`, `build`, `target`, `coverage`, `venv`, `__pycache__`. Not when Claude works in your home folder or straight in `~/Desktop`, `~/Downloads`, `~/Documents` and the like, because other apps save files there too; or
 - **anywhere Claude names it in its reply**, e.g. `~/Desktop/report.pdf`.
 
 Up to 5 come with the report, documents before image files; the rest are listed under `/sessions`.
@@ -335,6 +373,26 @@ It reads `oauthAccount.emailAddress` from `~/.claude.json`, which `ccs use` and 
 account=$(jq -r '.oauthAccount.emailAddress // empty | split("@")[0]' ~/.claude.json 2>/dev/null)
 line="$line $(printf '\033[36m@%s\033[0m' "$account")"
 ```
+
+## Files and data
+
+| File | Purpose | Installed to |
+|---|---|---|
+| `ccs` | main script (Python, standard library only) | `~/.local/bin/ccs` |
+| `menubar/` | the menu bar app (SwiftUI): `CCSUsage.swift`, `Info.plist`, `build.sh` | `~/Applications/CCS Usage.app` |
+| `uz.ccs.auto.plist` | auto-switch agent | `~/Library/LaunchAgents/` |
+| `uz.ccs.telegram.plist` | Telegram bot (always running) | `~/Library/LaunchAgents/` |
+| `uz.ccs.menubar.plist` | starts the menu bar app at login | `~/Library/LaunchAgents/` |
+| `test_ccs.py` | test (never touches your real login) | — |
+| `docs/` | the screenshots in this README | — |
+
+`ccs` keeps its data in these places:
+
+- **Tokens:** the macOS Keychain, in items named `ccs-account` (never in a plain file); the Telegram bot token is in `ccs-telegram`
+- **Account list:** `~/.claude-accounts.json`
+- **Usage cache and "Not now" answers:** `~/.claude-accounts-usage.json`
+- **Usage history** (chart and forecasts): `~/.claude-accounts-history.jsonl`
+- **Auto log:** `~/.claude-accounts.log`
 
 ## After changing the code
 

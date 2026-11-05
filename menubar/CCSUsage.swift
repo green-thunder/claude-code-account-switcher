@@ -354,10 +354,25 @@ struct CCSUsage: App {
 @MainActor func snapshot(to path: String, data file: String?) {
     let json = file.flatMap { FileManager.default.contents(atPath: $0) } ?? (try? ccs(["json"]))
     let accounts = json.flatMap { try? JSONDecoder().decode([Account].self, from: $0) } ?? []
-    let renderer = ImageRenderer(content: Popover().environmentObject(Store(accounts: accounts)))
-    renderer.scale = 2
-    guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
-          let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+    // a window-backed NSHostingView, unlike ImageRenderer, also draws the AppKit controls (menus, the 24h/7d switch)
+    _ = NSApplication.shared
+    let view = NSHostingView(rootView: Popover().environmentObject(Store(accounts: accounts)))
+    view.frame.size = view.fittingSize
+    let window = NSWindow(contentRect: view.frame, styleMask: .borderless, backing: .buffered, defer: false)
+    window.appearance = NSAppearance(named: .darkAqua)
+    window.contentView = view
+    view.layoutSubtreeIfNeeded()
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))  // let the chart and controls lay out
+    let size = view.bounds.size
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width) * 2, pixelsHigh: Int(size.height) * 2,
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
+        FileHandle.standardError.write("snapshot failed\n".data(using: .utf8)!)
+        exit(1)
+    }
+    rep.size = size  // 2x pixels: sharp on Retina screens
+    view.cacheDisplay(in: view.bounds, to: rep)
+    guard let png = rep.representation(using: .png, properties: [:]) else {
         FileHandle.standardError.write("snapshot failed\n".data(using: .utf8)!)
         exit(1)
     }
