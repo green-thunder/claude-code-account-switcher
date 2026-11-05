@@ -2,6 +2,8 @@
   <img src="docs/hero.jpg" width="900" alt="ccs: three Claude Code accounts with their usage bars in the terminal, the CCS Usage menu bar popover, and a permission request answered on the phone">
 </p>
 
+<h1 align="center">ccs: Claude Code account switcher for macOS</h1>
+
 <p align="center">
   <b>All your Claude Code accounts on one Mac.</b><br>
   See every 5-hour and weekly limit, switch in one click, and let it switch for you before a limit stops your work.
@@ -15,6 +17,7 @@
 </p>
 
 <p align="center">
+  <a href="https://green-thunder.github.io/ccs/">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#menu-bar-app">Menu bar</a> ·
@@ -384,7 +387,7 @@ line="$line $(printf '\033[36m@%s\033[0m' "$account")"
 | `uz.ccs.telegram.plist` | Telegram bot (always running) | `~/Library/LaunchAgents/` |
 | `uz.ccs.menubar.plist` | starts the menu bar app at login | `~/Library/LaunchAgents/` |
 | `test_ccs.py` | test (never touches your real login) | — |
-| `docs/` | the screenshots in this README | — |
+| `docs/` | the screenshots and the website ([GitHub Pages](https://green-thunder.github.io/ccs/)) | — |
 
 `ccs` keeps its data in these places:
 

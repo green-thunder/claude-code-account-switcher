@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccs: Claude Code account switcher for macOS</title>
+<meta name="description" content="Use multiple Claude Code accounts on one Mac. See every account's 5-hour and weekly usage limits and switch in one click from the terminal, the menu bar or Telegram. Free and open source.">
+<link rel="canonical" href="https://green-thunder.github.io/ccs/">
+<meta name="theme-color" content="#161B26">
+<meta property="og:type" content="website">
+<meta property="og:title" content="ccs: Claude Code account switcher for macOS">
+<meta property="og:description" content="Every Claude Code account on your Mac, its limits in view, one click to switch. Menu bar app, auto-switch and a Telegram bot.">
+<meta property="og:url" content="https://green-thunder.github.io/ccs/">
+<meta property="og:image" content="https://green-thunder.github.io/ccs/social.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://green-thunder.github.io/ccs/social.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "ccs",
+  "alternateName": "Claude Code account switcher",
+  "description": "Use multiple Claude Code accounts on one Mac: see every account's 5-hour and weekly usage limits and switch from the terminal, the menu bar or Telegram.",
+  "operatingSystem": "macOS 14 or later",
+  "applicationCategory": "DeveloperApplication",
+  "url": "https://green-thunder.github.io/ccs/",
+  "downloadUrl": "https://github.com/green-thunder/ccs",
+  "codeRepository": "https://github.com/green-thunder/ccs",
+  "license": "https://opensource.org/licenses/MIT",
+  "image": "https://green-thunder.github.io/ccs/social.png",
+  "screenshot": "https://green-thunder.github.io/ccs/hero.jpg",
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type": "Question", "name": "How do I use multiple Claude Code accounts on one Mac?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Install ccs and run it once to save the account you are logged into. In claude, run /login with the other account, then run ccs again. From then on, ccs use 2 switches to the second account, or use the menu bar app."}},
+    {"@type": "Question", "name": "How can I see my Claude Code usage limits?",
+     "acceptedAnswer": {"@type": "Answer", "text": "ccs shows each account's 5-hour session usage and weekly usage, with the time until each limit resets, in the terminal and in its menu bar app."}},
+    {"@type": "Question", "name": "What happens when an account gets close to its limit?",
+     "acceptedAnswer": {"@type": "Answer", "text": "The auto agent checks every 2 minutes. At 90% it asks whether to switch, and at 95% it switches by itself to the least-used account that is under 90%."}},
+    {"@type": "Question", "name": "Where does ccs keep my login tokens?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Only in the macOS Keychain, never in a plain file."}},
+    {"@type": "Question", "name": "Does ccs work on Linux or Windows?",
+     "acceptedAnswer": {"@type": "Answer", "text": "No. ccs is built on the macOS Keychain, launchd and SwiftUI, so it runs on macOS 14 or later only."}},
+    {"@type": "Question", "name": "Is it allowed to use several Claude accounts?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Using several accounts to get around usage limits may break Anthropic's terms. ccs is meant for people who have more than one account anyway, such as a team seat and a personal plan."}}
+  ]
+}
+</script>
+<style>
+  :root {
+    --ink: #161B26; --deep: #0E1220; --panel: #1D2331; --edge: #2A3245;
+    --text: #E8ECF4; --muted: #8A93A6; --green: #32D74B; --orange: #FF9F0A; --red: #FF453A;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: linear-gradient(160deg, var(--deep), var(--ink) 60%); background-attachment: fixed;
+    color: var(--text); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: var(--green); }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; }
+  .logo { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none;
+          font: 800 24px ui-monospace, "SF Mono", Menlo, monospace; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 999px;
+         font-weight: 600; text-decoration: none; border: 1px solid var(--edge); color: var(--text); background: var(--panel); }
+  .btn.primary { background: var(--green); color: #07130A; border-color: var(--green); }
+  .btn:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  header { text-align: center; padding: 40px 0 24px; }
+  h1 { font-size: clamp(32px, 6vw, 56px); line-height: 1.08; margin: 0 0 16px; letter-spacing: -0.02em; text-wrap: balance; }
+  .lead { color: var(--muted); font-size: clamp(17px, 2.4vw, 20px); max-width: 640px; margin: 0 auto 28px; }
+  .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .hero { margin: 40px auto 0; display: block; width: 100%; max-width: 900px; height: auto; border-radius: 18px;
+          box-shadow: 0 30px 80px rgba(0,0,0,.5); }
+  section { padding: 64px 0 0; }
+  h2 { font-size: clamp(24px, 4vw, 32px); margin: 0 0 24px; letter-spacing: -0.01em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 14px; padding: 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .shots { display: grid; grid-template-columns: 1.6fr 1fr; gap: 20px; align-items: start; }
+  .shots img { width: 100%; height: auto; border-radius: 12px; }
+  .shots figcaption { color: var(--muted); font-size: 14px; margin-top: 8px; }
+  figure { margin: 0; }
+  ol.steps { padding-left: 20px; }
+  ol.steps li { margin-bottom: 16px; }
+  pre { background: #10141D; border: 1px solid var(--edge); border-radius: 10px; padding: 12px 14px; overflow-x: auto;
+        font: 14px/1.5 ui-monospace, "SF Mono", Menlo, monospace; margin: 8px 0 0; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  details { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 14px 18px; margin-bottom: 10px; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { color: var(--muted); margin: 10px 0 0; }
+  footer { padding: 64px 0 40px; color: var(--muted); font-size: 14px; text-align: center; }
+  @media (max-width: 720px) { .shots { grid-template-columns: 1fr; } nav .btn span { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="logo" href="./" aria-label="ccs home">
+      <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true"><circle cx="14" cy="14" r="11" fill="none" stroke="#32D74B" stroke-width="3"/><path d="M14 14 L9 8" stroke="#32D74B" stroke-width="3" stroke-linecap="round"/></svg>
+      ccs
+    </a>
+    <a class="btn" href="https://github.com/green-thunder/ccs">★ <span>Star on</span> GitHub</a>
+  </nav>
+
+  <header>
+    <h1>Claude Code account switcher for macOS</h1>
+    <p class="lead">Keep all your Claude Code accounts signed in on one Mac. See each one's 5-hour and weekly usage limits, switch in one click, and let it switch for you before a limit stops your work.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/green-thunder/ccs">Get it on GitHub</a>
+      <a class="btn" href="#install">Install in 2 minutes</a>
+    </div>
+    <img class="hero" src="hero.jpg" width="1800" height="1440" alt="ccs listing three Claude Code accounts with usage bars in the terminal, the CCS Usage menu bar popover, and a permission request answered on the phone">
+  </header>
+
+  <section aria-labelledby="features">
+    <h2 id="features">Everything about your Claude Code limits, in one place</h2>
+    <div class="grid">
+      <div class="card"><h3>🖥 Terminal</h3><p><code>ccs</code> lists every account with its limits and reset times. <code>ccs use 2</code> switches.</p></div>
+      <div class="card"><h3>📊 Menu bar</h3><p>The active account's usage at all times. Click for usage cards, pace markers, a 24-hour chart and a Switch button per account.</p></div>
+      <div class="card"><h3>⚡ Auto-switch</h3><p>Checks every 2 minutes. At 90% it asks, at 95% it moves you to the least-used account.</p></div>
+      <div class="card"><h3>📱 Telegram bot</h3><p>Usage and switching from your phone. While you're away, Claude's permission prompts and questions come with buttons.</p></div>
+      <div class="card"><h3>🔔 Alerts</h3><p>A report when a task finishes, a forecast before a limit runs out, and a warning when usage rises while your Mac is idle.</p></div>
+      <div class="card"><h3>🔒 Keychain only</h3><p>Tokens never touch a plain file. <code>.env</code> files, keys and folders you list never leave the Mac.</p></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="screens">
+    <h2 id="screens">See it</h2>
+    <div class="shots">
+      <figure><img src="terminal.png" width="1044" height="502" loading="lazy" alt="Terminal output of ccs: three accounts, each with 5-hour and weekly usage bars in green, orange or red"><figcaption><code>ccs</code> in the terminal: green below 70%, orange from 70%, red from 90%.</figcaption></figure>
+      <figure><img src="popover.png" width="660" height="1682" loading="lazy" alt="The CCS Usage menu bar popover with session and weekly usage cards, a history chart and other accounts"><figcaption>The menu bar popover.</figcaption></figure>
+    </div>
+  </section>
+
+  <section aria-labelledby="install">
+    <h2 id="install">Install</h2>
+    <p>You need macOS 14+, the <code>claude</code> CLI and python.org Python 3.9+ at <code>/usr/local/bin/python3</code>. No other dependencies.</p>
+    <ol class="steps">
+      <li>Get the script:
+        <pre><code>git clone https://github.com/green-thunder/ccs && cd ccs
+mkdir -p ~/.local/bin && cp ccs ~/.local/bin/ccs && chmod +x ~/.local/bin/ccs</code></pre></li>
+      <li>Save your current account, sign in to the next one, save it too:
+        <pre><code>ccs            # saves the account you're logged into
+claude         # then /login with the other account
+ccs            # adds it to the list</code></pre></li>
+      <li>Switch any time:
+        <pre><code>ccs use 2</code></pre></li>
+    </ol>
+    <p>The menu bar app, auto-switch and the Telegram bot each take one more command. See the <a href="https://github.com/green-thunder/ccs#install">full install guide</a>.</p>
+  </section>
+
+  <section aria-labelledby="faq">
+    <h2 id="faq">Questions</h2>
+    <details><summary>How do I use multiple Claude Code accounts on one Mac?</summary>
+      <p>Install ccs and run it once to save the account you are logged into. In <code>claude</code>, run <code>/login</code> with the other account, then run <code>ccs</code> again. From then on, <code>ccs use 2</code> switches to the second account, or use the menu bar app.</p></details>
+    <details><summary>How can I see my Claude Code usage limits?</summary>
+      <p>ccs shows each account's 5-hour session usage and weekly usage, with the time until each limit resets, in the terminal and in its menu bar app.</p></details>
+    <details><summary>What happens when an account gets close to its limit?</summary>
+      <p>The auto agent checks every 2 minutes. At 90% it asks whether to switch, and at 95% it switches by itself to the least-used account that is under 90%.</p></details>
+    <details><summary>Where does ccs keep my login tokens?</summary>
+      <p>Only in the macOS Keychain, never in a plain file.</p></details>
+    <details><summary>Does ccs work on Linux or Windows?</summary>
+      <p>No. ccs is built on the macOS Keychain, launchd and SwiftUI, so it runs on macOS 14 or later only.</p></details>
+    <details><summary>Is it allowed to use several Claude accounts?</summary>
+      <p>Using several accounts to get around usage limits may break Anthropic's terms. ccs is meant for people who have more than one account anyway, such as a team seat and a personal plan.</p></details>
+  </section>
+
+  <footer>
+    <p>ccs is free and open source under the <a href="https://github.com/green-thunder/ccs/blob/main/LICENSE">MIT license</a>. Not affiliated with or endorsed by Anthropic.</p>
+  </footer>
+</div>
+</body>
+</html>
