@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>uz.ccs.telegram</string>
+  <!-- the bot: long-polls Telegram, so it needs no server or open port; idles until `ccs tg setup` -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/python3</string>
+    <string>-u</string>
+    <string>__HOME__/.local/bin/ccs</string>
+    <string>tg</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.claude-accounts.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.claude-accounts.log</string>
+</dict>
+</plist>

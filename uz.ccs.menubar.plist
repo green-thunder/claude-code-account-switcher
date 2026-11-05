@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>uz.ccs.menubar</string>
+  <!-- the menu bar app (menubar/build.sh builds it); starts at login, restarts after a crash but not after Quit -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/Applications/CCS Usage.app/Contents/MacOS/CCSUsage</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+</dict>
+</plist>

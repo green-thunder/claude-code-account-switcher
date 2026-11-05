@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>uz.ccs.auto</string>
+  <!-- explicit python: launchd's PATH would pick Apple's /usr/bin/python3 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/python3</string>
+    <string>__HOME__/.local/bin/ccs</string>
+    <string>auto</string>
+    <string>--once</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.claude-accounts.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.claude-accounts.log</string>
+</dict>
+</plist>

@@ -1,0 +1,1434 @@
+#!/usr/bin/env python3
+"""ccs — Claude Code account switcher (macOS): 5h / 7d usage, manual and auto switch.
+
+  ccs                    list saved accounts with usage (also saves the account you are logged into now)
+  ccs use N|email        switch claude to account N
+  ccs auto [--ask 90] [--at 95] [--every 120] [--once]
+                         at --ask % ask (dialog) to switch to the least-used account; at --at % switch by itself.
+                         Only switches to an account that is under --ask %.
+  ccs rm N|email         forget an account
+  ccs json               accounts and usage as JSON, for the menu bar app (menubar/)
+  ccs tg setup           connect a Telegram bot (token from @BotFather); open the link it prints on your phone
+  ccs tg                 run the bot: usage, switch buttons, the --ask question, and a chat with Claude
+                         (plain messages; /new, /chats, /clear deletes the current chat)
+  ccs hook               Claude Code hook: records each session's state and written files (for /sessions and 📎);
+                         reports with screenshots and documents (Stop), what blocks a task (Notification), and while
+                         the Mac has had no input for 60 s: Claude's questions (PreToolUse) and permission
+                         requests (PermissionRequest) answered on the phone
+
+Add an account: run `ccs`, then in claude run /login with the other account, then run `ccs` again.
+"""
+import base64, contextlib, getpass, hashlib, html, json, os, queue, re, secrets, shutil, ssl, subprocess, sys
+import threading, time, urllib.error, urllib.request
+from datetime import datetime
+
+KC = "Claude Code-credentials"  # Claude Code's own keychain item (default config dir)
+STORE = "ccs-account"  # our keychain items, one per saved account
+TG = "ccs-telegram"  # keychain item {"token", "chat": owner chat id, "pair": one-time code until paired}
+USER = os.environ.get("USER") or os.getlogin()
+CFG = os.path.expanduser("~/.claude.json")
+META = os.path.expanduser("~/.claude-accounts.json")  # non-secret account info, in list order
+CACHE = os.path.expanduser("~/.claude-accounts-usage.json")  # shared by ccs, the auto agent and the menu bar
+HISTORY = os.path.expanduser("~/.claude-accounts-history.jsonl")  # usage samples: the chart and the forecasts
+SESS = os.path.expanduser("~/.claude-sessions")  # per session: <id>.json from the status line, <id>.log from hooks
+CHAT = os.path.expanduser("~/.ccs-chat")  # the Telegram chat's working folder (empty) and its state.json
+CLAUDE = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")  # launchd's PATH lacks ~/.local/bin
+PROJECTS = os.path.expanduser("~/.claude/projects")  # Claude Code's transcripts, one folder per working directory
+# The phone chat can search the web but has no tool that touches this Mac, and loads no settings, plugins or MCP servers:
+# whoever gets into the Telegram account can only chat.
+CHAT_ARGS = ["-p", "--output-format", "json", "--restricted", "--tools", "WebSearch,WebFetch", "--strict-mcp-config",
+             "--append-system-prompt", "You are chatting with the user through a Telegram bot on their phone. Keep answers "
+             "easy to read on a small screen: short paragraphs, lists rather than tables. You can search the web; "
+             "you have no access to the user's computer or files."]
+NO_SEND = os.path.expanduser("~/.ccs-no-send")  # folders whose files the bot never sends, one per line
+# file names never sent: env files, keys, certificates, database dumps, anything named secret/credential/password
+# what a task hands over as a result: documents, tables, archives, image files (charts); sent with the report
+DELIVERABLE = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|odt|ods|odp|csv|zip|epub|png|jpe?g|gif|webp)$", re.I)
+SKIP_DIRS = {"node_modules", "dist", "build", "target", "coverage", "venv", "__pycache__"}  # plus hidden folders
+SECRET = re.compile(r"^\.env(\..+)?$|^id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key|p12|pfx|jks|keystore|sql|dump|sqlite3?|db)(\.gz)?$"
+                    r"|secret|credential|passw", re.I)
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TLS = ssl.create_default_context(cafile="/etc/ssl/cert.pem")  # python.org Python ships without CA certs
+WINDOWS = [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_sonnet", "7d Sonnet"), ("seven_day_opus", "7d Opus")]
+
+
+def kc_get(svc, acct):
+    r = subprocess.run(["security", "find-generic-password", "-s", svc, "-a", acct, "-w"], capture_output=True, text=True)
+    return json.loads(r.stdout) if r.returncode == 0 else None
+
+
+def kc_set(svc, acct, data):
+    hx = json.dumps(data).encode().hex()
+    cmd = f'add-generic-password -U -a "{acct}" -s "{svc}" -X "{hx}"\n'
+    # same as Claude Code: stdin keeps tokens out of `ps`; argv only past security -i's line limit
+    if len(cmd) <= 4032:
+        r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+    else:
+        r = subprocess.run(["security", "add-generic-password", "-U", "-a", acct, "-s", svc, "-X", hx], capture_output=True, text=True)
+    if r.returncode or r.stderr.strip():
+        sys.exit(f"keychain write failed: {r.stderr.strip()}")
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"  # per process: the agent and the menu bar may save at the same time
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def kid(acc):
+    return f'{acc["accountUuid"]}:{acc.get("organizationUuid") or ""}'
+
+
+def sync():
+    """Save the account claude is logged into now (Claude Code rotates its tokens). Returns its key."""
+    acc = load(CFG).get("oauthAccount")
+    tok = (kc_get(KC, USER) or {}).get("claudeAiOauth")
+    if not (acc and tok):
+        return None
+    k, meta = kid(acc), load(META)
+    if meta.get(k) != acc:
+        meta[k] = acc
+        save(META, meta)
+    if kc_get(STORE, k) != tok:
+        kc_set(STORE, k, tok)
+    return k
+
+
+def http(url, token=None, body=None, timeout=20):
+    h = {"User-Agent": "ccs", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, body and json.dumps(body).encode(), h)
+    with urllib.request.urlopen(req, timeout=timeout, context=TLS) as r:
+        return json.load(r)
+
+
+def renew(tok):
+    """A fresh access token for an expired one (the refresh token rotates too)."""
+    r = http(TOKEN_URL, body={"grant_type": "refresh_token", "refresh_token": tok["refreshToken"],
+                              "client_id": CLIENT_ID, "scope": " ".join(tok["scopes"])})
+    return {**tok, "accessToken": r["access_token"], "refreshToken": r.get("refresh_token", tok["refreshToken"]),
+            "expiresAt": int((time.time() + r["expires_in"]) * 1000)}
+
+
+def renew_active(old):
+    """The active account's token expired and no running claude renewed it: renew it and hand it to Claude Code.
+    Written only if Claude Code didn't renew it meanwhile, so neither overwrites the other's newer token."""
+    new = renew(old)
+    creds = kc_get(KC, USER) or {}
+    if (creds.get("claudeAiOauth") or {}).get("refreshToken") != old["refreshToken"]:
+        return creds["claudeAiOauth"]  # claude got there first: use its token
+    creds["claudeAiOauth"] = new  # keeps mcpOAuth and anything else in the item
+    kc_set(KC, USER, creds)
+    return new
+
+
+def busy_here(since):
+    """Was any Claude Code session on this Mac (desktop app and phone chat included) active since then?"""
+    return any(s["at"] >= since or s["state"] == "working" for s in sessions())
+
+
+def window_id(resets_at):
+    """A limit window's id: its reset time to the nearest 5 minutes. The API's value jitters by about a second,
+    sometimes across a minute (14:59:59.9 → 15:00:00.4), so comparing to the minute saw resets that weren't."""
+    return str(round(datetime.fromisoformat(resets_at).timestamp() / 300) * 300) if resets_at else ""
+
+
+def watch(k, active, prev, cur):
+    """Telegram warning when an account's 5h usage rose and nothing on this Mac explains it: another device,
+    a leaked `claude setup-token`, or your own claude.ai chats. At most once an hour per account."""
+    p, n = (prev.get("u") or {}).get("five_hour") or {}, (cur.get("u") or {}).get("five_hour") or {}
+    if not (p and n and prev.get("at")):
+        return
+    same_window = window_id(p.get("resets_at")) == window_id(n.get("resets_at"))
+    before = (p.get("utilization") or 0) if same_window else 0
+    rise, since = (n.get("utilization") or 0) - before, prev["at"] - 300  # usage shows up with some delay
+    cache = load(CACHE)
+    # here explains it only for the account in use (or one switched away from in the meantime)
+    explained = busy_here(since) and (k == active or cache.get("switched", 0) >= since)
+    if rise < 2 or explained or time.time() - cache.get("watched", {}).get(k, 0) < 3600:
+        return
+    cache.setdefault("watched", {})[k] = time.time()
+    save(CACHE, cache)
+    name = load(META).get(k, {}).get("emailAddress", k)
+    tg_send(f"⚠️ <b>{esc(name)}</b> · 5h usage rose {before:.0f}% → {n.get('utilization') or 0:.0f}% between "
+            f"{time.strftime('%H:%M', time.localtime(prev['at']))} and {time.strftime('%H:%M')}, while nothing on this "
+            "Mac was using Claude.\n\nIf that wasn't you on claude.ai or another device, someone may be using this "
+            "account, for example with a setup-token.",
+            [[{"text": "Claude Code tokens", "url": "https://claude.ai/settings/claude-code"},
+              {"text": "Devices & sessions", "url": "https://claude.ai/settings/account"}]])
+
+
+def log_usage(k, u):
+    """Append a 5h / 7d sample to the history file; once it passes 2 MB it keeps the last 8 days."""
+    pct = lambda key: (u.get(key) or {}).get("utilization")
+    with open(HISTORY, "a") as f:
+        f.write(json.dumps({"t": round(time.time()), "k": k, "5h": pct("five_hour"), "7d": pct("seven_day")}) + "\n")
+    if os.path.getsize(HISTORY) > 2_000_000:  # shortcut: a sample appended during the trim is lost; harmless
+        with open(HISTORY) as f:
+            keep = [line for line in f if json.loads(line)["t"] > time.time() - 8 * 86400]
+        tmp = f"{HISTORY}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.writelines(keep)
+        os.replace(tmp, HISTORY)
+
+
+def history(since):
+    """{account: [samples]} from the history file, oldest first."""
+    out = {}
+    try:
+        with open(HISTORY) as f:
+            for line in f:
+                try:
+                    s = json.loads(line)
+                except ValueError:
+                    continue
+                if s["t"] >= since:
+                    out.setdefault(s["k"], []).append(s)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def when_text(t):
+    """14:20 today, otherwise Nov 1, 14:20."""
+    same_day = time.localtime(t)[:3] == time.localtime()[:3]
+    return time.strftime("%H:%M" if same_day else "%b %-d, %H:%M", time.localtime(t))
+
+
+def pace_alerts(k, active, prev, cur):
+    """Telegram heads-ups: "free again" when a limit you'd nearly used up resets (any account), and a forecast when
+    the account in use is on track to run out before the reset (once per limit window)."""
+    name = load(META).get(k, {}).get("emailAddress", k)
+    for key, field, label, lookback, horizon in (("five_hour", "5h", "5h", 3600, 3600),
+                                                 ("seven_day", "7d", "weekly", 12 * 3600, 86400)):
+        p, n = ((prev.get("u") or {}).get(key) or {}), ((cur.get("u") or {}).get(key) or {})
+        window = window_id(n.get("resets_at"))
+        if not (n and window):
+            continue
+        was, now_pct = (p.get("utilization") or 0), (n.get("utilization") or 0)
+        if p and window_id(p.get("resets_at")) != window and was >= 80 and now_pct < was:  # a real reset drops it
+            tg_send(f"✅ <b>{esc(name)}</b> · the {label} limit reset (was {p['utilization']:.0f}%): it's free again.")
+        if k != active:
+            continue
+        samples = [(s["t"], s[field]) for s in history(time.time() - lookback).get(k, []) if s.get(field) is not None]
+        if len(samples) < 2 or samples[-1][0] - samples[0][0] < lookback / 6:
+            continue  # too little to tell a pace from
+        (t0, v0), (t1, v1) = samples[0], samples[-1]
+        rate = (v1 - v0) / (t1 - t0)  # percent per second
+        reset = datetime.fromisoformat(n["resets_at"]).timestamp()
+        eta = t1 + (100 - v1) / rate if rate > 0 else None
+        cache = load(CACHE)
+        if not eta or eta >= reset or eta - time.time() > horizon or cache.get("forecast", {}).get(f"{k}:{key}") == window:
+            continue
+        cache.setdefault("forecast", {})[f"{k}:{key}"] = window
+        save(CACHE, cache)
+        # say what auto-switch will really do: with its defaults it only moves you to an account under 90%
+        others = sorted((worst(cache.get(o, {}).get("u")), o) for o in load(META) if o != k
+                        if worst(cache.get(o, {}).get("u")) is not None)
+        other = others and load(META)[others[0][1]]["emailAddress"]
+        then = ("" if not others else f"Auto-switch moves you to {esc(other)} at 95%." if others[0][0] < 90
+                else f"No other account has room ({esc(other)} is at {others[0][0]:.0f}%), so auto-switch won't move you.")
+        tg_send(f"⏱ <b>{esc(name)}</b> · at this pace the {label} limit runs out around <b>{when_text(eta)}</b>, "
+                f"{duration(reset - eta)} before it resets ({when_text(reset)}). {then}".rstrip())
+
+
+def usage(k, active):
+    """Usage dict from the API, or an error string. Cached: the API allows only a few calls a minute."""
+    cache, now = load(CACHE), time.time()
+    c = cache.get(k, {})
+    if now < max(c.get("at", 0) + 120, c.get("retry", 0)):
+        return c.get("u") or f"rate limited, retry in {c['retry'] - now:.0f}s"
+    soon = now * 1000 + 60_000
+    try:
+        if k == active:
+            tok = kc_get(KC, USER)["claudeAiOauth"]
+            if tok["expiresAt"] < soon:
+                tok = renew_active(tok)
+        else:
+            tok = kc_get(STORE, k)
+            if tok["expiresAt"] < soon:
+                tok = renew(tok)
+                kc_set(STORE, k, tok)
+        cache[k] = {"at": now, "u": http(USAGE_URL, tok["accessToken"])}
+        save(CACHE, cache)
+        log_usage(k, cache[k]["u"])
+        watch(k, active, c, cache[k])
+        pace_alerts(k, active, c, cache[k])
+        return cache[k]["u"]
+    except urllib.error.HTTPError as e:
+        if e.code == 429:  # back off as told; keep showing the last numbers meanwhile
+            cache[k] = {**c, "retry": now + int(e.headers.get("Retry-After") or 60)}
+            save(CACHE, cache)
+            return c.get("u") or f"rate limited, retry in {cache[k]['retry'] - now:.0f}s"
+        return f"HTTP {e.code}" + (", log in to this account again" if e.code in (400, 401) else "")
+    except (OSError, KeyError, TypeError) as e:
+        return f"error: {e!r}"
+
+
+def worst(u):
+    """Highest of the 5h and 7d utilization (%), None if unknown."""
+    if not isinstance(u, dict):
+        return None
+    return max((u[w]["utilization"] or 0 for w in ("five_hour", "seven_day") if u.get(w)), default=0)
+
+
+def left(iso):
+    if not iso:
+        return "-"
+    s = max(0, datetime.fromisoformat(iso).timestamp() - time.time())
+    d, h, m = int(s // 86400), int(s % 86400 // 3600), int(s % 3600 // 60)
+    return f"{d}d{h}h" if d else f"{h}h{m:02d}m"
+
+
+ANSI = sys.stdout.isatty()
+
+
+def paint(text, code):
+    return f"\033[{code}m{text}\033[0m" if ANSI else text
+
+
+def level(p):
+    return "31" if p >= 90 else "33" if p >= 70 else "32"
+
+
+def meter(label, p, reset):
+    n = round(min(p, 100) / 10)
+    return f"{label:<9} {paint('█' * n, level(p))}{paint('░' * (10 - n), '90')} {paint(f'{p:3.0f}%', level(p))}   ↻ {reset}"
+
+
+def plan(a):
+    """e.g. 'Team · Max 5x'"""
+    parts = [a.get("organizationType", "").removeprefix("claude_"),
+             (a.get("userRateLimitTier") or "").removeprefix("default_claude_").replace("_", " ")]
+    return " · ".join(dict.fromkeys(s[:1].upper() + s[1:] for s in parts if s))
+
+
+def windows(u):
+    """[(label, percent, time to reset)] for the limits this account has."""
+    return [(label, u[w]["utilization"] or 0, left(u[w].get("resets_at"))) for w, label in WINDOWS if u.get(w)]
+
+
+def rows():
+    active, meta = sync(), load(META)
+    if not meta:
+        sys.exit("No accounts yet. Log in with `claude` (/login), then run ccs again.")
+    return [(i, k == active, a, usage(k, active)) for i, (k, a) in enumerate(meta.items(), 1)]
+
+
+def report(rs):
+    out = []
+    for i, on, a, u in rs:
+        out.append(f"{paint('●', '32') if on else '○'} {i}  {a['emailAddress']}   {paint(plan(a), '90')}")
+        out += [f"     {line}" for line in ([meter(*w) for w in windows(u)] if isinstance(u, dict) else [paint(f"⚠ {u}", "33")])]
+    return out
+
+
+def ls():
+    print("\n".join(report(rows())))
+
+
+def as_json():
+    """For the menu bar app: every account with each limit's percent and reset time (epoch seconds), and its
+    history: 5h usage over the last day in 15-minute steps, weekly usage over the last 7 days in 2-hour steps."""
+    out, hist = [], history(time.time() - 7 * 86400)
+
+    def steps(samples, field, span, size):  # the highest value in each step
+        top = {}
+        for s in samples:
+            if s["t"] >= time.time() - span and s.get(field) is not None:
+                b = s["t"] // size * size
+                top[b] = max(top.get(b, 0), s[field])
+        return [[b, v] for b, v in sorted(top.items())]
+    for i, on, a, u in rows():
+        ok, samples = isinstance(u, dict), hist.get(kid(a), [])
+        out.append({"n": i, "active": on, "email": a["emailAddress"], "plan": plan(a), "error": None if ok else u,
+                    "limits": [{"key": w, "label": label, "pct": u[w]["utilization"] or 0,
+                                "resets": datetime.fromisoformat(u[w]["resets_at"]).timestamp() if u[w].get("resets_at") else None}
+                               for w, label in WINDOWS if ok and u.get(w)],
+                    "history": {"day": steps(samples, "5h", 86400, 900), "week": steps(samples, "7d", 7 * 86400, 7200)}})
+    print(json.dumps(out))
+
+
+def pick(arg):
+    meta = load(META)
+    keys = list(meta)
+    if arg.isdigit() and 0 < int(arg) <= len(keys):
+        return keys[int(arg) - 1]
+    hits = [k for k in keys if arg.lower() in meta[k]["emailAddress"].lower()]
+    if len(hits) != 1:
+        sys.exit(f"No single account matches {arg!r}, see `ccs`.")
+    return hits[0]
+
+
+def use(k):
+    if k == sync():
+        return print("Already active.")
+    tok = kc_get(STORE, k)
+    if not tok:  # writing None would log claude out
+        sys.exit("Saved login for that account is missing; log in to it with /login again.")
+    creds = kc_get(KC, USER) or {}
+    creds["claudeAiOauth"] = tok  # keeps mcpOAuth and anything else in the item
+    kc_set(KC, USER, creds)
+    cfg = load(CFG)
+    cfg["oauthAccount"] = load(META)[k]
+    save(CFG, cfg)
+    cache = load(CACHE)
+    cache["switched"] = time.time()  # usage the old account gets now may still be ours: watch() allows for it
+    save(CACHE, cache)
+    print(f"Switched to {cfg['oauthAccount']['emailAddress']}. Running sessions pick it up after a short cache; "
+          "if one doesn't, restart it with `claude -c`.")
+
+
+def notify(text):
+    subprocess.run(["osascript", "-e", f'display notification "{text}" with title "ccs"'])
+    tg_send(html.escape(text))
+
+
+def ask_switch(w, frm, to):
+    """Dialog. Returns the button clicked ("Switch" / "Not now"), or "" if nobody answered within 100 s."""
+    msg = f"{frm} has used {w:.0f}% of its limit.\\n\\nSwitch Claude Code to {to}?"
+    r = subprocess.run(["osascript", "-e", f'display dialog "{msg}" with title "Claude Code" buttons {{"Not now", "Switch"}} '
+                        'default button "Switch" with icon caution giving up after 100'], capture_output=True, text=True)
+    m = re.search(r"button returned:([^,]*)", r.stdout)
+    return m.group(1) if m else ""
+
+
+def consent(w, at, active, to, u):
+    """True to switch now: by itself at --at %, below that only if the user clicks Switch."""
+    if w >= at:
+        return True
+    window = window_id((u.get("five_hour") or {}).get("resets_at"))  # "Not now" holds until this 5h window resets
+    if load(CACHE).get("declined", {}).get(active) == window:
+        return False
+    meta = load(META)
+    frm, dest = meta[active]["emailAddress"], meta[to]["emailAddress"]
+    cache = load(CACHE)
+    # the phone gets one question per 5h window; the dialog repeats
+    if cache.get("tg_asked", {}).get(active) != window and tg_send(
+            html.escape(f"{frm} has used {w:.0f}% of its limit. Switch Claude Code to {dest}?\n"
+                        f"Without an answer it switches by itself at {at:.0f}%."),
+            [[{"text": "Switch", "callback_data": f"use:{hid(to)}"},
+              {"text": "Not now", "callback_data": f"no:{hid(active)}:{window}"}]]):
+        cache.setdefault("tg_asked", {})[active] = window
+        save(CACHE, cache)
+    answer = ask_switch(w, frm, dest)  # a Telegram answer meanwhile is handled by the bot (`ccs tg`)
+    if answer == "Not now":
+        cache = load(CACHE)  # reload: the dialog may have been open a while
+        cache.setdefault("declined", {})[active] = window
+        save(CACHE, cache)
+    return answer == "Switch"
+
+
+def auto(ask, at, every, once):
+    while True:
+        active = sync()
+        u = usage(active, active) if active else "not logged in"
+        w = worst(u)
+        stamp = time.strftime("%H:%M")
+        if w is None:
+            print(f"{stamp} active account usage unknown: {u}", flush=True)
+        elif w < ask:
+            print(f"{stamp} {w:.0f}% used, ok", flush=True)
+        else:
+            cands = [(worst(usage(k, active)), k) for k in load(META) if k != active]
+            cands = sorted(c for c in cands if c[0] is not None and c[0] < ask)  # only accounts with real room
+            if not cands:
+                print(f"{stamp} at {w:.0f}%, no other account is under {ask:.0f}%", flush=True)
+            elif consent(w, at, active, cands[0][1], u):
+                use(cands[0][1])
+                notify(f"{w:.0f}% used, switched to {load(META)[cands[0][1]]['emailAddress']}")
+            else:
+                print(f"{stamp} {w:.0f}% used, staying; switches by itself at {at:.0f}%", flush=True)
+        if once:
+            return
+        time.sleep(every)
+
+
+def hid(k):
+    """Short account id for Telegram buttons (callback data is limited to 64 bytes)."""
+    return hashlib.sha1(k.encode()).hexdigest()[:12]
+
+
+def tg(cfg, method, **params):
+    return http(f"https://api.telegram.org/bot{cfg['token']}/{method}", body=params, timeout=70)["result"]
+
+
+def tg_send(text, buttons=None, cfg=None):
+    """Message the paired phone (HTML). True if sent; does nothing until the bot is set up and paired."""
+    cfg = cfg or kc_get(TG, "bot")
+    if not (cfg and cfg.get("chat")):
+        return False
+    try:
+        tg(cfg, "sendMessage", chat_id=cfg["chat"], text=text, parse_mode="HTML",
+           **({"reply_markup": {"inline_keyboard": buttons}} if buttons else {}))
+        return True
+    except OSError as e:
+        print(f"telegram send failed: {e}", flush=True)
+        return False
+
+
+def tg_show(cfg, text, buttons, edit=None):
+    """Send a view, or redraw the message whose button was pressed."""
+    if not edit:
+        return tg_send(text, buttons, cfg)
+    try:
+        tg(cfg, "editMessageText", chat_id=cfg["chat"], message_id=edit, text=text, parse_mode="HTML",
+           reply_markup={"inline_keyboard": buttons})
+    except urllib.error.HTTPError:  # "message is not modified" when nothing changed
+        pass
+
+
+def tg_status(cfg, note="", edit=None):
+    """Usage report with a switch button per other account."""
+    rs = rows()
+    text = (f"<b>{html.escape(note)}</b>\n" if note else "") + f"<pre>{html.escape(chr(10).join(report(rs)))}</pre>"
+    buttons = [[{"text": f"Switch to {a['emailAddress']}", "callback_data": f"use:{hid(kid(a))}"}] for _, on, a, _ in rs if not on]
+    buttons.append([{"text": "↻ Refresh", "callback_data": "status"}, {"text": "🖥 Sessions", "callback_data": "sessions"}])
+    tg_show(cfg, text, buttons, edit)
+
+
+def ago(t):
+    m = int((time.time() - t) // 60)
+    return "just now" if m < 1 else f"{m}m ago" if m < 60 else f"{m // 60}h ago"
+
+
+def tg_sessions(cfg, note="", edit=None):
+    """Recent Claude Code sessions: project, title, state, model, effort, context, files written."""
+    ss, blocks = [s for s in sessions() if s["id"] != "phone-chat"], []  # the phone chat has /chats
+    for s in ss:
+        _, title = transcript(s.get("transcript"))
+        ctx = s.get("ctx")
+        details = " · ".join(x for x in (s.get("model"), s.get("effort") and f"effort {s['effort']}",
+                                         ctx is not None and f"context left {ctx:.0f}%") if x)
+        state = {"working": "⚙️ working", "waiting": "⏳ needs you", "idle": "💤 idle"}.get(s["state"], "• open")
+        blocks.append(f"<b>{esc(project(s))}</b> · {state} · {ago(s['at'])}"
+                      + (f"\n<i>{esc(title)}</i>" if title else "") + (f"\n{esc(details)}" if details else "")
+                      + (f"\n{esc(s['note'])}" if s["state"] == "waiting" and s.get("note") else "")
+                      + (f"\n📎 {len(s['files'])} file(s) written" if s["files"] else ""))
+    text = (f"<b>{esc(note)}</b>\n" if note else "") + (
+        f"🖥 <b>Sessions ({len(ss)})</b>\n\n" + "\n\n".join(blocks) if ss else "No Claude Code session in the last 2 hours.")
+    buttons = [[{"text": f"📎 {project(s)} ({len(s['files'])})", "callback_data": f"files:{s['id']}"}] for s in ss if s["files"]]
+    buttons.append([{"text": "↻ Refresh", "callback_data": "sessions"}, {"text": "📊 Usage", "callback_data": "status"}])
+    tg_show(cfg, text, buttons, edit)
+
+
+def file_button(sid, n, path):
+    return [{"text": f"📎 {os.path.basename(path)}", "callback_data": f"file:{sid}:{n}"}]
+
+
+def tg_files(cfg, sid):
+    """The last 10 files Claude wrote in a session; blocked ones are listed with the reason, without a button."""
+    s, rows_, buttons = session(sid), [], []
+    for n, path in list(enumerate(s["files"]))[-10:]:
+        reason = why_not(path)
+        rows_.append(f"{'🚫' if reason else '•'} <code>{esc(short(path, s))}</code>" + (f" ({reason})" if reason else ""))
+        if not reason:
+            buttons.append(file_button(sid, n, path))
+    tg_send(f"📎 <b>{esc(project(s))}</b> · files Claude wrote\n\n" + ("\n".join(rows_) or "None yet."), buttons, cfg)
+
+
+def tg_upload(cfg, method, field, name, data, caption=""):
+    """Upload bytes to the phone (multipart): sendDocument with field "document", sendPhoto with "photo"."""
+    b = secrets.token_hex(16)
+    name = re.sub(r'["\r\n]', "", name)
+    body = (f'--{b}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{cfg["chat"]}\r\n'
+            f'--{b}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'
+            f'--{b}\r\nContent-Disposition: form-data; name="{field}"; filename="{name}"\r\n'
+            f'Content-Type: application/octet-stream\r\n\r\n').encode() + data + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{cfg['token']}/{method}", body,
+                                 {"Content-Type": f"multipart/form-data; boundary={b}"})
+    with urllib.request.urlopen(req, timeout=300, context=TLS) as r:
+        return json.load(r)["result"]
+
+
+def tg_file(cfg, path, caption):
+    with open(path, "rb") as f:
+        return tg_upload(cfg, "sendDocument", "document", os.path.basename(path), f.read(), caption)
+
+
+def tg_send_file(cfg, sid, n):
+    """Send one file Claude wrote in that session if the safety rules allow it; returns the note for the button."""
+    files = session(sid)["files"]
+    if not (n.isdigit() and int(n) < len(files)):
+        return "Unknown file."
+    path = files[int(n)]
+    if reason := why_not(path):  # checked again on tap: the file may have changed since the button was made
+        return f"🚫 Not sent: {reason}."
+    tg_file(cfg, path, short(path, session(sid)))
+    print(f"{time.strftime('%H:%M')} telegram: sent {path}", flush=True)
+    return f"Sent {os.path.basename(path)}"
+
+
+def tg_handle(cfg, up):
+    cb = up.get("callback_query")
+    msg = cb["message"] if cb else up.get("message") or {}
+    chat, text = msg.get("chat", {}).get("id"), "" if cb else msg.get("text", "")
+    if cfg.get("chat") is None and cfg.get("pair") and text == f"/start {cfg['pair']}":
+        cfg["chat"] = chat  # whoever opened the one-time link from `ccs tg setup` becomes the owner
+        del cfg["pair"]
+        kc_set(TG, "bot", cfg)
+        print(f"telegram: paired with chat {chat}", flush=True)
+    if chat is None or chat != cfg.get("chat"):
+        return print(f"telegram: ignored a message from chat {chat}", flush=True)  # only the owner may see or switch
+    replied = (msg.get("reply_to_message") or {}).get("message_id")
+    if text and not cb and (waiting := ask_for_message(replied)):  # a reply to a question: your own answer
+        return tg_send(esc(tg_answer(cfg, *waiting, replied, text=text)), cfg=cfg)
+    if text and not text.startswith("/"):
+        return chat_q.put(text)  # a plain message is for Claude; answered in order by chat_worker
+    if text.startswith("/new"):  # a new conversation; the old one stays in /chats, the model and effort stay too
+        st = load(f"{CHAT}/state.json")
+        if st.pop("session", None):
+            save(f"{CHAT}/state.json", st)
+        return tg_send(f"🆕 New chat started ({esc(chat_mode(st))}). Ask me anything; /chats goes back to old ones.", cfg=cfg)
+    cmd, _, rest = text.partition(" ")
+    data = (cb["data"] if cb else f"use:{rest.strip()}" if cmd == "/use" and rest.strip()
+            else f"{cmd[1:]}:{rest.strip()}" if cmd in ("/model", "/effort")
+            else cmd[1:] if cmd in ("/sessions", "/chats", "/clear") else "status")
+    act, _, arg = data.partition(":")
+    note, view = "", {"sessions": tg_sessions, "chats": tg_chats, "delok": tg_chats, "model": tg_chat_mode,
+                      "effort": tg_chat_mode}.get(act, tg_status)
+    edit = msg.get("message_id") if cb else None
+    try:
+        if act in ("pa", "pd"):  # ✅ Allow / ⛔ Deny on a permission request
+            view = None
+            note = tg_permit(cfg, arg, act == "pa", edit)
+        elif act in ("q", "qd"):  # a button on a waiting question: an option, or ✅ Done
+            view = None
+            qid, qi, *pick = arg.split(":")
+            note = tg_answer(cfg, qid, qi, edit, pick=pick[0] if pick else None, done=act == "qd")
+        elif act in ("model", "effort") and arg:
+            note = chat_set(act, arg)
+        elif act == "chat":
+            view = None  # the reminder comes as a new message
+            note = chat_resume(cfg, arg)
+        elif act == "clear":  # /clear: delete the current chat, after a confirmation
+            view, current = None, load(f"{CHAT}/state.json").get("session")
+            if current:
+                tg_chat_confirm(cfg, current)
+            else:
+                tg_send("No chat is open: nothing to delete.", cfg=cfg)
+        elif act == "del":
+            view = None
+            tg_chat_confirm(cfg, arg, edit)
+        elif act == "delok":
+            note = chat_delete(arg)  # then the list is shown again, with the note
+        elif act == "files":
+            view = None  # the list comes as a new message; the pressed one stays as it is
+            tg_files(cfg, arg)
+        elif act == "file":
+            view = None
+            note = tg_send_file(cfg, *arg.rsplit(":", 1))
+        elif act == "use":
+            k = next((k for k in load(META) if hid(k) == arg), None) or pick(arg)
+            use(k)
+            note = f"Active: {load(META)[k]['emailAddress']}"
+        elif act == "no":
+            h, _, window = arg.partition(":")
+            k = next(k for k in load(META) if hid(k) == h)
+            cache = load(CACHE)
+            cache.setdefault("declined", {})[k] = window
+            save(CACHE, cache)
+            note = "OK, staying for now."
+    except (Exception, SystemExit) as e:  # pick()/use() exit on bad input; the bot must keep running
+        note = f"Failed: {e}"
+    if cb:  # a refused file gets a pop-up so the reason can't be missed
+        tg(cfg, "answerCallbackQuery", callback_query_id=cb["id"], text=note[:200], show_alert=note.startswith("🚫"))
+    if view:
+        view(cfg, note, edit)
+
+
+COMMANDS = [("status", "Usage of every account, switch buttons"),
+            ("sessions", "Active Claude Code sessions and their files"),
+            ("use", "Switch account: /use 2 or /use gmail"),
+            ("new", "Start a new chat (any other message goes to Claude)"),
+            ("chats", "Your last 10 chats: continue or delete one"),
+            ("clear", "Delete the current chat"),
+            ("model", "Chat model: fable, opus, sonnet, haiku"),
+            ("effort", "Chat effort: low, medium, high, xhigh, max")]
+MODELS = ["fable", "opus", "sonnet", "haiku"]  # aliases for the latest of each; a full model name also works
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+chat_q = queue.Queue()
+
+
+def chat_mode(st):
+    return f"model {st.get('model', 'default')}, effort {st.get('effort', 'default')}"
+
+
+def chat_set(key, value):
+    """Remember the chat's model or effort ("default" forgets it); returns the note for the reply."""
+    value = value.lower()
+    if value != "default" and not (value in EFFORTS if key == "effort" else re.fullmatch(r"[a-z0-9][\w.\[\]-]*", value)):
+        return f"Unknown {key}: {value}"
+    os.makedirs(CHAT, mode=0o700, exist_ok=True)
+    st = load(f"{CHAT}/state.json")
+    if value == "default":
+        st.pop(key, None)
+    else:
+        st[key] = value
+    save(f"{CHAT}/state.json", st)
+    return f"Chat {key}: {value}"
+
+
+def chat_dir():
+    """Where Claude Code keeps the phone chat's transcripts (it names the folder after the working directory)."""
+    return f"{PROJECTS}/{re.sub(r'[^A-Za-z0-9]', '-', CHAT)}"
+
+
+def first_prompt(path):
+    """The first message of a chat transcript, which names the chat in /chats."""
+    with open(path) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            c = e.get("message", {}).get("content") if e.get("type") == "user" else None
+            if isinstance(c, list):
+                c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+            if isinstance(c, str) and c.strip():
+                return " ".join(c.split())
+    return "(empty)"
+
+
+def when(t):
+    return time.strftime("%H:%M" if time.localtime(t)[:3] == time.localtime()[:3] else "%b %d", time.localtime(t))
+
+
+def tg_chats(cfg, note="", edit=None):
+    """The last 10 phone chats, newest first; a button continues one (▶ = the current chat)."""
+    d, current = chat_dir(), load(f"{CHAT}/state.json").get("session")
+    names = sorted((n for n in os.listdir(d) if n.endswith(".jsonl")) if os.path.isdir(d) else [],
+                   key=lambda n: -os.path.getmtime(f"{d}/{n}"))[:10]
+    buttons = []
+    for n in names:
+        sid = n[:-6]
+        buttons.append([{"text": f"{'▶ ' if sid == current else ''}{shorten(first_prompt(f'{d}/{n}'))} · "
+                                 f"{when(os.path.getmtime(f'{d}/{n}'))}", "callback_data": f"chat:{sid}"},
+                        {"text": "🗑", "callback_data": f"del:{sid}"}])
+    text = (f"<b>{esc(note)}</b>\n" if note else "") + (
+        "💬 <b>Your chats</b>, newest first. Tap one to continue it, 🗑 to delete it." if names
+        else "No chats yet: just write a message.")
+    tg_show(cfg, text, buttons, edit)
+
+
+def shorten(text, n=40):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def chat_file(sid):
+    """Transcript path of a phone chat, or None: ids from buttons can't reach other projects' sessions."""
+    path = f"{chat_dir()}/{sid}.jsonl"
+    return path if re.fullmatch(r"[\w-]+", sid) and os.path.isfile(path) else None
+
+
+def tg_chat_confirm(cfg, sid, edit=None):
+    """Ask before deleting a chat; Cancel goes back to the list."""
+    if not (path := chat_file(sid)):
+        return tg_send("Chat not found.", cfg=cfg)
+    tg_show(cfg, f"🗑 Delete the chat “{esc(shorten(first_prompt(path)))}”? This can't be undone.",
+            [[{"text": "🗑 Delete", "callback_data": f"delok:{sid}"}, {"text": "Cancel", "callback_data": "chats"}]], edit)
+
+
+def chat_delete(sid):
+    """Delete a phone chat's transcript (and Claude Code's side folder for it); forget it if it was the current chat."""
+    if not (path := chat_file(sid)):
+        return "Chat not found."
+    name = shorten(first_prompt(path))
+    os.remove(path)
+    if os.path.isdir(f"{chat_dir()}/{sid}"):
+        shutil.rmtree(f"{chat_dir()}/{sid}")
+    st = load(f"{CHAT}/state.json")
+    if st.get("session") != sid:
+        return f"🗑 Deleted “{name}”."
+    del st["session"]
+    save(f"{CHAT}/state.json", st)
+    return f"🗑 Deleted “{name}”. Your next message starts a new chat."
+
+
+def chat_resume(cfg, sid):
+    """Continue an old phone chat; shows its first message and Claude's last answer as a reminder."""
+    if not (path := chat_file(sid)):
+        return "Chat not found."
+    save(f"{CHAT}/state.json", {**load(f"{CHAT}/state.json"), "session": sid})
+    reply, _ = transcript(path)
+    tg_send(f"💬 <b>Back in:</b> {esc(first_prompt(path)[:200])}\n"
+            + (f"<blockquote expandable>{md_html(clip(reply, 2800))}</blockquote>\n" if reply else "")
+            + "Continue writing.", cfg=cfg)
+    return "Chat resumed"
+
+
+def tg_chat_mode(cfg, note="", edit=None):
+    """The chat's model and effort, with a button for each choice (✓ = current)."""
+    st = load(f"{CHAT}/state.json")
+    row = lambda key, values: [{"text": ("✓ " if st.get(key, "default") == v else "") + v, "callback_data": f"{key}:{v}"}
+                               for v in values]
+    text = ((f"<b>{esc(note)}</b>\n" if note else "") + f"💬 <b>Chat</b>: {esc(chat_mode(st))}\n"
+            "Applies from your next message; the conversation continues.")
+    tg_show(cfg, text, [row("model", MODELS), row("model", ["default"]), row("effort", EFFORTS[:3]),
+                        row("effort", EFFORTS[3:] + ["default"])], edit)
+
+
+def chunks(md, size=3500):
+    """Split markdown into Telegram-sized parts at line breaks; a code block cut in two is closed and reopened."""
+    parts, cur, n = [], [], 0
+    for line in md.splitlines():
+        for piece in [line[i:i + size] for i in range(0, len(line), size)] or [""]:
+            if cur and n + len(piece) > size:
+                parts, cur, n = parts + ["\n".join(cur)], [], 0
+            cur, n = cur + [piece], n + len(piece) + 1
+    out, carry = [], False
+    for p in parts + ["\n".join(cur)]:
+        p = ("```\n" if carry else "") + p
+        carry = p.count("```") % 2 == 1
+        out.append(p + ("\n```" if carry else ""))
+    return [p for p in out if p.strip()]
+
+
+def typing(cfg, stop):
+    """Telegram's "typing…" while Claude works (it lasts 5 s per call)."""
+    while not stop.is_set():
+        try:
+            tg(cfg, "sendChatAction", chat_id=cfg["chat"], action="typing")
+        except OSError:
+            pass
+        stop.wait(4)
+
+
+def chat_turn(cfg, text):
+    """One message of the phone chat: the same Claude session continues until /new."""
+    os.makedirs(CHAT, mode=0o700, exist_ok=True)
+    # the chat runs without hooks: log its activity so watch() doesn't take its usage for someone else's
+    record({"session_id": "phone-chat", "hook_event_name": "UserPromptSubmit", "cwd": CHAT})
+    st = load(f"{CHAT}/state.json")
+    opts = []
+    for flag, key in (("--resume", "session"), ("--model", "model"), ("--effort", "effort")):
+        if st.get(key):
+            opts += [flag, st[key]]
+    stop = threading.Event()
+    threading.Thread(target=typing, args=(cfg, stop), daemon=True).start()
+    try:  # the message goes in on stdin, so text starting with "-" can't be read as an option
+        p = subprocess.run([CLAUDE, *CHAT_ARGS, *opts], input=text, cwd=CHAT,
+                           capture_output=True, text=True, timeout=1800)
+    finally:
+        stop.set()
+        record({"session_id": "phone-chat", "hook_event_name": "Stop", "cwd": CHAT})
+    try:
+        r = [e for e in json.loads(p.stdout) if e.get("type") == "result"][-1]
+    except (ValueError, IndexError, AttributeError):
+        r = {"is_error": True, "result": (p.stderr or p.stdout).strip()[-500:] or f"claude exited with {p.returncode}"}
+    if r.get("session_id"):
+        save(f"{CHAT}/state.json", {**load(f"{CHAT}/state.json"), "session": r["session_id"]})
+    if r.get("is_error"):
+        return tg_send(esc(f"⚠️ {r.get('result') or 'Claude failed'}\n\nIf this keeps happening, send /clear."), cfg=cfg)
+    for part in chunks(r.get("result") or "(empty answer)"):
+        tg_send(md_html(part), cfg=cfg) or tg_send(esc(part), cfg=cfg)  # plain text if the formatting is refused
+
+
+def chat_worker():
+    while True:
+        text = chat_q.get()
+        cfg = kc_get(TG, "bot")
+        try:
+            chat_turn(cfg, text)
+        except Exception as e:  # one failed answer must not stop the chat
+            print(f"{time.strftime('%H:%M')} telegram chat: {e!r}", flush=True)
+            tg_send(esc(f"⚠️ Chat failed: {e}"), cfg=cfg)
+
+
+def morning(cfg):
+    """Once a day between 9:00 and 12:00 (the first bot loop then, e.g. when the Mac wakes): every account's usage."""
+    today, cache = time.strftime("%Y-%m-%d"), load(CACHE)
+    if not (cfg.get("chat") and 9 <= time.localtime().tm_hour < 12 and cache.get("morning") != today):
+        return
+    cache["morning"] = today
+    save(CACHE, cache)
+    tg_status(cfg, "☀️ Good morning: your limits today")
+
+
+def tg_loop():
+    global ANSI
+    ANSI = False  # Telegram gets plain text
+    threading.Thread(target=chat_worker, daemon=True).start()
+    offset = menu = None
+    while True:
+        cfg = kc_get(TG, "bot")  # re-read: `ccs tg setup` may change it while this runs
+        if not cfg:
+            time.sleep(60)
+            continue
+        try:
+            if menu != cfg["token"]:  # fills Telegram's "/" menu; once per start or new bot
+                tg(cfg, "setMyCommands", commands=[{"command": c, "description": d} for c, d in COMMANDS])
+                menu = cfg["token"]
+            morning(cfg)
+            ups = tg(cfg, "getUpdates", timeout=50, allowed_updates=["message", "callback_query"],
+                     **({"offset": offset} if offset else {}))
+        except OSError as e:
+            print(f"{time.strftime('%H:%M')} telegram: {e}", flush=True)
+            time.sleep(30)
+            continue
+        for up in ups:
+            offset = up["update_id"] + 1  # advance first: a failing update must not be retried forever
+            try:
+                tg_handle(cfg, up)
+            except Exception as e:
+                print(f"{time.strftime('%H:%M')} telegram: {e!r}", flush=True)
+
+
+def tg_setup():
+    token = getpass.getpass("Bot token from @BotFather (input hidden): ").strip()
+    if not re.fullmatch(r"\d+:[\w-]+", token):
+        sys.exit("That doesn't look like a bot token (digits:letters).")
+    try:
+        me = tg({"token": token}, "getMe")
+    except urllib.error.HTTPError:
+        sys.exit("Telegram rejected that token.")
+    code = secrets.token_urlsafe(12)
+    kc_set(TG, "bot", {"token": token, "chat": None, "pair": code})
+    print(f"Saved. On your phone open this link and press Start (it works once, for you only):\n"
+          f"  https://t.me/{me['username']}?start={code}")
+
+
+def idle():
+    """Seconds since the last keyboard/mouse input on this Mac (inf if unknown, so alerts still go out)."""
+    out = subprocess.run(["ioreg", "-c", "IOHIDSystem", "-d", "4"], capture_output=True, text=True).stdout
+    m = re.search(r'"HIDIdleTime" = (\d+)', out)
+    return int(m.group(1)) / 1e9 if m else float("inf")
+
+
+def transcript(path):
+    """(Claude's last text reply, session title) from a session transcript."""
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except (OSError, TypeError):
+        return "", ""
+    reply = title = ""
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        title = title or (d.get("aiTitle") or "" if d.get("type") == "ai-title" else "")
+        content = d.get("message", {}).get("content") if d.get("type") == "assistant" and not reply else None
+        if isinstance(content, list):
+            reply = "\n".join(c["text"] for c in content if isinstance(c, dict) and c.get("type") == "text").strip()
+        if reply and title:
+            break
+    return reply, title
+
+
+def clip(md, limit):
+    """Cut markdown at a line break before `limit`, closing an open code block."""
+    if len(md) > limit:
+        md = md[:md.rfind("\n", 0, limit) if "\n" in md[:limit] else limit].rstrip() + "\n…"
+    return md + ("\n```" if md.count("```") % 2 else "")
+
+
+def esc(s):
+    return html.escape(s, quote=False)  # Telegram HTML needs only & < > escaped
+
+
+def inline(s):
+    """`code`, **bold** and [links](https://…) to Telegram HTML; everything else escaped."""
+    out = []
+    for part in re.split(r"(`[^`\n]+`)", s):
+        if len(part) > 1 and part[0] == part[-1] == "`":
+            out.append(f"<code>{esc(part[1:-1])}</code>")
+        else:
+            part = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(part))
+            out.append(re.sub(r'\[([^\]]+)\]\((https?://[^)\s"]+)\)', r'<a href="\2">\1</a>', part))
+    return "".join(out)
+
+
+def md_html(md):
+    """Claude's markdown to Telegram HTML. Tables become bullet lines, which read better on a phone than columns."""
+    out, code, table = [], None, False
+    for line in md.splitlines():
+        row = line.lstrip().startswith("|")
+        if line.lstrip().startswith("```"):
+            if code is None:
+                code = []
+            else:
+                out.append(f"<pre>{esc(chr(10).join(code))}</pre>")
+                code = None
+        elif code is not None:
+            code.append(line)
+        elif row and re.fullmatch(r"[\s|:-]+", line) or re.fullmatch(r"\s*-{3,}\s*", line):
+            pass  # table separator row, horizontal rule
+        elif row and not table:
+            pass  # header row: the bullet lines read fine without it
+        elif row:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            # bold can't contain code in Telegram, so the first cell loses its backticks
+            out.append(f"• <b>{esc(re.sub(r'[`*]', '', cells[0]))}</b>" + "".join(f" · {inline(c)}" for c in cells[1:] if c))
+        elif m := re.match(r"\s*#{1,6}\s+(.*)", line):
+            out.append(f"<b>{esc(re.sub(r'[`*]', '', m.group(1)))}</b>")
+        elif m := re.match(r"(\s*)[-*]\s+(.*)", line):
+            out.append(f"{m.group(1)}• {inline(m.group(2))}")
+        else:
+            out.append(inline(line))
+        table = row
+    return "\n".join(out).strip()
+
+
+def record(ev):
+    """Append a hook event to the session's log: its state for /sessions and the files Claude wrote."""
+    sid = ev.get("session_id") or ""
+    if not re.fullmatch(r"[\w-]+", sid):
+        return
+    e = {"t": time.time(), "e": ev.get("hook_event_name"), "cwd": ev.get("cwd"), "transcript": ev.get("transcript_path")}
+    if e["e"] == "PostToolUse":
+        path = (ev.get("tool_input") or {}).get("file_path") or (ev.get("tool_input") or {}).get("notebook_path")
+        if not path:
+            return
+        e["file"] = os.path.join(ev.get("cwd") or "", path)
+    if e["e"] == "Notification":
+        e["msg"] = ev.get("message")
+    if e["e"] == "PermissionRequest":
+        e["msg"] = f"Claude asks to use {ev.get('tool_name') or 'a tool'}"
+    if e["e"] == "PreToolUse":  # AskUserQuestion: the only PreToolUse hook
+        e["msg"] = "Claude asks: " + (((ev.get("tool_input") or {}).get("questions") or [{}])[0].get("question") or "")
+    os.makedirs(SESS, mode=0o700, exist_ok=True)
+    with open(f"{SESS}/{sid}.log", "a") as f:
+        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def session(sid):
+    """What the status line and the hooks saved about a session; "turn" = files written since the last prompt."""
+    s = {"id": sid, "state": "", "files": [], "turn": [], "at": 0}
+    if not re.fullmatch(r"[\w-]+", sid):  # the id comes back from Telegram buttons
+        return s
+    s.update(load(f"{SESS}/{sid}.json"))
+    try:
+        with open(f"{SESS}/{sid}.log") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        s["at"] = max(s["at"], e["t"])
+        s["cwd"], s["transcript"] = s.get("cwd") or e.get("cwd"), s.get("transcript") or e.get("transcript")
+        if e.get("file"):
+            s["files"] += [] if e["file"] in s["files"] else [e["file"]]
+            s["turn"] += [] if e["file"] in s["turn"] else [e["file"]]
+        else:
+            s["state"] = {"UserPromptSubmit": "working", "Notification": "waiting", "PreToolUse": "waiting",
+                          "PermissionRequest": "waiting",
+                          "Answered": "working", "Stop": "idle", "SessionEnd": "ended"}.get(e["e"], s["state"])
+            s["note"] = e.get("msg")
+            if e["e"] == "UserPromptSubmit":
+                s["turn"], s["started"] = [], e["t"]
+    return s
+
+
+def sessions(max_age=2 * 3600):
+    """Sessions active in the last 2 hours, newest first. Records older than a week are deleted."""
+    names = os.listdir(SESS) if os.path.isdir(SESS) else []
+    out = []
+    for sid in {n.rsplit(".", 1)[0] for n in names if n.endswith((".json", ".log"))}:
+        s = session(sid)
+        if time.time() - s["at"] > 7 * 86400:
+            for ext in (".json", ".log", ".img"):
+                if os.path.exists(f"{SESS}/{sid}{ext}"):
+                    os.remove(f"{SESS}/{sid}{ext}")
+        elif s["state"] != "ended" and time.time() - s["at"] < max_age:
+            out.append(s)
+    return sorted(out, key=lambda s: -s["at"])
+
+
+def project(s):
+    return os.path.basename(s.get("cwd") or "") or "claude"
+
+
+def short(path, s):
+    """Path relative to the session's project when inside it."""
+    rel = os.path.relpath(path, s["cwd"]) if s.get("cwd") else ""
+    return rel if rel and not rel.startswith("..") else path
+
+
+def private(path):
+    """True inside a folder listed in ~/.ccs-no-send (symlinks resolved): its content never leaves the Mac."""
+    if not path:
+        return False
+    try:
+        with open(NO_SEND) as f:
+            blocked = [os.path.realpath(os.path.expanduser(l.strip())) for l in f if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        return False
+    real = os.path.realpath(path)
+    return any(real == d or real.startswith(d + os.sep) for d in blocked)
+
+
+def why_not(path):
+    """Why a file must not go to Telegram ('' if it may): secrets, folders in ~/.ccs-no-send, missing, empty, too big."""
+    real = os.path.realpath(path)  # symlinks can't sneak around the rules
+    if SECRET.search(os.path.basename(real)):
+        return "looks like a secret, key or database dump"
+    if private(real):
+        return "its folder is in ~/.ccs-no-send"
+    if not os.path.isfile(real):
+        return "the file no longer exists"
+    size = os.path.getsize(real)
+    return "the file is empty" if not size else "bigger than Telegram's 50 MB limit" if size > 50 * 1024 ** 2 else ""
+
+
+def is_prompt(e):
+    """A message you typed (not a tool result or attachment Claude Code adds as a user message)."""
+    c = e.get("message", {}).get("content") if e.get("type") == "user" and not e.get("isMeta") else None
+    if isinstance(c, list):
+        return any(isinstance(b, dict) and b.get("type") == "text" for b in c) and \
+            not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+    return isinstance(c, str) and bool(c.strip())
+
+
+def images_in(e):
+    """[(media type, bytes)] of the images inside an entry's tool results (screenshots, previews)."""
+    out, content = [], e.get("message", {}).get("content")
+    for b in content if isinstance(content, list) else []:
+        inner = b.get("content") if isinstance(b, dict) and b.get("type") == "tool_result" else None
+        for x in inner if isinstance(inner, list) else []:
+            if not (isinstance(x, dict) and x.get("type") == "image"):
+                continue
+            src = x.get("source") or {}
+            if src.get("type") == "base64" and src.get("data"):
+                out.append((src.get("media_type") or "image/png", base64.b64decode(src["data"])))
+    return out
+
+
+def turn_images(path, since=0):
+    """Images from tool results since your last prompt and after transcript line `since`; also returns the line count.
+    Reads backwards and stops at the prompt: transcripts full of screenshots get large."""
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except (OSError, TypeError):
+        return [], 0
+    since = since if since <= len(lines) else 0  # the transcript was rewritten (compacted)
+    imgs = []
+    for line in reversed(lines[since:]):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if is_prompt(e):
+            break
+        imgs = images_in(e) + imgs
+    return imgs, len(lines)
+
+
+def send_images(cfg, ev, limit=4):
+    """Send the phone the screenshots of this task it hasn't seen yet (the last `limit` of them)."""
+    sid = ev.get("session_id") or ""
+    if not (cfg and cfg.get("chat") and re.fullmatch(r"[\w-]+", sid)):
+        return
+    mark = f"{SESS}/{sid}.img"  # transcript line up to which images were sent
+    try:
+        with open(mark) as f:
+            since = int(f.read())
+    except (OSError, ValueError):
+        since = 0
+    imgs, seen = turn_images(ev.get("transcript_path"), since)
+    os.makedirs(SESS, mode=0o700, exist_ok=True)
+    with open(mark, "w") as f:
+        f.write(str(seen))
+    shown = imgs[-limit:]
+    for i, (mtype, data) in enumerate(shown, 1):
+        caption = f"🖼 {project(ev)} · {i}/{len(shown)}" + (f" (the last {limit} of {len(imgs)})" if len(imgs) > limit else "")
+        name = "image." + mtype.split("/")[-1]
+        try:
+            tg_upload(cfg, "sendPhoto", "photo", name, data, caption)
+        except urllib.error.HTTPError:  # too big or odd proportions for a photo: send it as a file
+            tg_upload(cfg, "sendDocument", "document", name, data, caption)
+
+
+def made_files(s, reply, max_dirs=3000):
+    """Deliverables this task produced, oldest first: changed since your prompt, under the project (build output
+    and hidden folders skipped) or anywhere Claude names them in its reply, e.g. ~/Desktop/report.pdf."""
+    since, cwd, found = s.get("started"), s.get("cwd"), {}
+    if not since:
+        return []
+
+    def consider(path):  # one entry per real file; the path is kept as found, for short captions
+        if DELIVERABLE.search(path) and os.path.isfile(path) and os.path.getmtime(path) >= since:
+            found.setdefault(os.path.realpath(path), (os.path.getmtime(path), path))
+    for m in re.finditer(r"[\w./~-]+\.[A-Za-z0-9]{2,5}\b", reply or ""):
+        path = os.path.expanduser(m.group())
+        consider(path if os.path.isabs(path) else os.path.join(cwd or "", path))
+    for n, (root, dirs, files) in enumerate(os.walk(cwd) if cwd else []):
+        if n >= max_dirs:  # a huge tree: what the reply names still counts
+            break
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in files:
+            consider(os.path.join(root, name))
+    return [path for _, path in sorted(found.values())]
+
+
+def send_made(cfg, s, reply, limit=5):
+    """Send the deliverables of this task with the report (up to `limit`); they also join the session's 📎 list."""
+    if not (cfg and cfg.get("chat") and re.fullmatch(r"[\w-]+", s["id"])):
+        return
+    files = [p for p in made_files(s, reply) if not why_not(p)]
+    # documents first: a task that saves dozens of screenshots for a guide must not crowd out the guide's PDF
+    files.sort(key=lambda p: bool(re.search(r"\.(png|jpe?g|gif|webp)$", p, re.I)))
+    os.makedirs(SESS, mode=0o700, exist_ok=True)
+    with open(f"{SESS}/{s['id']}.log", "a") as f:
+        for p in files:
+            if p not in s["files"]:
+                f.write(json.dumps({"t": time.time(), "e": "Made", "file": p}, ensure_ascii=False) + "\n")
+    for p in files[:limit]:
+        with open(p, "rb") as f:
+            data = f.read()
+        is_photo = re.search(r"\.(png|jpe?g|gif|webp)$", p, re.I)
+        try:
+            tg_upload(cfg, "sendPhoto" if is_photo else "sendDocument", "photo" if is_photo else "document",
+                      os.path.basename(p), data, short(p, s))
+        except urllib.error.HTTPError:  # a photo Telegram won't take: as a file
+            tg_upload(cfg, "sendDocument", "document", os.path.basename(p), data, short(p, s))
+    if len(files) > limit:
+        tg_send(f"📎 {len(files) - limit} more file(s) from this task: /sessions", cfg=cfg)
+
+
+def ask_file(qid):
+    return f"{SESS}/asks/{qid}.json" if re.fullmatch(r"[0-9a-f]{8}", qid or "") else ""
+
+
+def ask_view(qid, qi, p):
+    """Text and buttons of one waiting question (✓ = multi-select picks so far)."""
+    q, chosen = p["questions"][qi], p["multi"].get(str(qi), [])
+    opts = "\n".join(f"• <b>{esc(o['label'])}</b>" + (f" — {esc(o['description'])}" if o.get("description") else "")
+                     for o in q["options"])
+    text = (f"❓ <b>{esc(p['project'])}</b> · Claude asks\n<b>{esc(q.get('header') or '')}</b> {esc(q['question'])}\n\n"
+            f"{opts}\n\n" + ("Tick any, then ✅ Done. " if q.get("multiSelect") else "")
+            + "Or reply to this message with your own answer.")
+    kb = [[{"text": ("✓ " if i in chosen else "") + shorten(o["label"], 60), "callback_data": f"q:{qid}:{qi}:{i}"}]
+          for i, o in enumerate(q["options"])]
+    return text, kb + ([[{"text": "✅ Done", "callback_data": f"qd:{qid}:{qi}"}]] if q.get("multiSelect") else [])
+
+
+def wait_for_phone(qid, p, done):
+    """Save `p` where the bot writes the answers, then wait until done(p), you touch the Mac, or 25 minutes pass."""
+    os.makedirs(f"{SESS}/asks", mode=0o700, exist_ok=True)
+    save(ask_file(qid), p)
+    try:
+        deadline = time.time() + 25 * 60
+        while not done(p) and time.time() < deadline and idle() > 3:
+            time.sleep(1)
+            p = load(ask_file(qid)) or p
+    finally:
+        os.remove(ask_file(qid))
+    return p
+
+
+def approve(ev):
+    """PermissionRequest hook. While you're away, the request goes to the phone with ✅ Allow / ⛔ Deny and the full
+    command. At the Mac (or for a ~/.ccs-no-send folder) it's asked there as usual, and the Notification hook still
+    pings the phone. Returns the hook decision, or None to leave it to the Mac."""
+    cfg, tool, inp = kc_get(TG, "bot"), ev.get("tool_name") or "a tool", ev.get("tool_input") or {}
+    if tool == "AskUserQuestion" or not (cfg and cfg.get("chat")) or private(ev.get("cwd")) or idle() < 60:
+        return None
+    detail = inp.get("command") or inp.get("file_path") or inp.get("url") or json.dumps(inp, ensure_ascii=False, indent=1)
+    text = (f"🔐 <b>{esc(project(ev))}</b> · Claude asks to use <b>{esc(tool)}</b>"
+            + (f"\n{esc(inp['description'])}" if inp.get("description") else "") + f"\n<pre>{esc(shorten(detail, 1500))}</pre>")
+    qid = secrets.token_hex(4)
+    sent = tg(cfg, "sendMessage", chat_id=cfg["chat"], text=text, parse_mode="HTML",
+              reply_markup={"inline_keyboard": [[{"text": "✅ Allow", "callback_data": f"pa:{qid}"},
+                                                 {"text": "⛔ Deny", "callback_data": f"pd:{qid}"}]]})
+    p = wait_for_phone(qid, {"project": project(ev), "tool": tool, "text": text}, lambda p: "decision" in p)
+    if "decision" not in p:
+        with contextlib.suppress(OSError):
+            tg(cfg, "editMessageText", chat_id=cfg["chat"], message_id=sent["message_id"], parse_mode="HTML",
+               text=f"{text}\n⌛ This request is on the Mac now.")
+        return None
+    record({**ev, "hook_event_name": "Answered"})
+    decision = {"behavior": "allow"} if p["decision"] == "allow" else {"behavior": "deny", "message": "Denied from the phone."}
+    return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}
+
+
+def tg_permit(cfg, qid, allow, msg_id):
+    """✅ Allow / ⛔ Deny pressed on a waiting permission request."""
+    path = ask_file(qid)
+    p = load(path) if path else {}
+    if "tool" not in p:
+        return "This request isn't waiting any more."
+    if "decision" in p:
+        return "Already answered."
+    p["decision"] = "allow" if allow else "deny"
+    save(path, p)
+    tg(cfg, "editMessageText", chat_id=cfg["chat"], message_id=msg_id, parse_mode="HTML",
+       text=f"{p['text']}\n{'✅ Allowed' if allow else '⛔ Denied'}")
+    return "Sent to Claude"
+
+
+def ask(ev):
+    """PreToolUse hook on AskUserQuestion. While you're away, Claude's questions go to the phone and the answers
+    come back as yours. If you return to the Mac first, or nobody answers in 25 minutes, the question shows on the
+    Mac as usual. Returns the hook decision, or None to leave the question to the Mac."""
+    cfg, qs = kc_get(TG, "bot"), (ev.get("tool_input") or {}).get("questions") or []
+    if not (cfg and cfg.get("chat") and qs):
+        return None
+    if private(ev.get("cwd")):  # ~/.ccs-no-send folders: the question itself stays on the Mac
+        tg_send(f"❓ <b>{esc(project(ev))}</b> · Claude asks a question. Answer it at the Mac: "
+                "this folder is in ~/.ccs-no-send.", cfg=cfg)
+        return None
+    if idle() < 60:  # you're at the Mac: the question shows there; the phone gets a heads-up for other windows
+        tg_send(f"❓ <b>{esc(project(ev))}</b> · Claude asks: {esc(qs[0].get('question') or '')}\n"
+                "Answer it at the Mac.", cfg=cfg)
+        return None
+    send_images(cfg, ev)  # what Claude just looked at, so you can decide on the phone
+    qid = secrets.token_hex(4)
+    p = {"project": project(ev), "questions": qs, "answers": {}, "multi": {}, "messages": {}}
+    for qi in range(len(qs)):
+        text, kb = ask_view(qid, qi, p)
+        sent = tg(cfg, "sendMessage", chat_id=cfg["chat"], text=text, parse_mode="HTML", reply_markup={"inline_keyboard": kb})
+        p["messages"][str(sent["message_id"])] = qi
+    p = wait_for_phone(qid, p, lambda p: len(p["answers"]) == len(qs))
+    if len(p["answers"]) < len(qs):
+        for m in p["messages"]:
+            with contextlib.suppress(OSError):
+                tg(cfg, "editMessageText", chat_id=cfg["chat"], message_id=int(m), parse_mode="HTML",
+                   text=f"⌛ <b>{esc(p['project'])}</b> · this question is on the Mac now.")
+        return None
+    record({**ev, "hook_event_name": "Answered"})
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                   "updatedInput": {"questions": qs, "answers": p["answers"]}}}
+
+
+def ask_for_message(message_id):
+    """(question id, question index) of the waiting question shown in that Telegram message, or None."""
+    d = f"{SESS}/asks"
+    for n in os.listdir(d) if message_id and os.path.isdir(d) else []:
+        qi = load(f"{d}/{n}").get("messages", {}).get(str(message_id))
+        if qi is not None:
+            return n[:-5], qi
+    return None
+
+
+def tg_answer(cfg, qid, qi, msg_id, pick=None, text=None, done=False):
+    """An answer from the phone to a waiting question: an option, ✅ Done after multi-select ticks, or typed text."""
+    path = ask_file(qid)
+    p = load(path) if path else {}
+    if not p:
+        return "This question isn't waiting any more."
+    qi = int(qi)
+    q, chosen = p["questions"][qi], p["multi"].setdefault(str(qi), [])
+    if q["question"] in p["answers"]:
+        return "Already answered."
+    if text is None and q.get("multiSelect") and not done:  # a tick: redraw the buttons
+        i = int(pick)
+        if i in chosen:
+            chosen.remove(i)
+        else:
+            chosen.append(i)
+        save(path, p)
+        tg_show(cfg, *ask_view(qid, qi, p), msg_id)
+        return ""
+    if text is not None:
+        answer = text
+    elif done:
+        if not chosen:
+            return "Tick at least one option first."
+        answer = ", ".join(q["options"][i]["label"] for i in sorted(chosen))
+    else:
+        answer = q["options"][int(pick)]["label"]
+    p["answers"][q["question"]] = answer
+    save(path, p)
+    tg(cfg, "editMessageText", chat_id=cfg["chat"], message_id=msg_id, parse_mode="HTML",
+       text=f"✅ <b>{esc(p['project'])}</b> · {esc(q['question'])}\n→ <b>{esc(answer)}</b>")
+    return "Sent to Claude"
+
+
+def duration(sec):
+    m = int(sec // 60)
+    return f"{int(sec)}s" if m < 1 else f"{m}m" if m < 60 else f"{m // 60}h {m % 60}m"
+
+
+def hook():
+    """Claude Code hook. Every event: keep the session's state and written files for /sessions.
+    AskUserQuestion: ask on the phone while you're away (a heads-up while you're at the Mac).
+    PermissionRequest: ✅ Allow / ⛔ Deny on the phone while you're away.
+    Stop: report to the phone with this task's screenshots and the documents it produced (PDF, Office, CSV…),
+    unless it was a quick reply while you're at the Mac.
+    Notification: forward what blocks the task (permission prompts), not the "waiting for your input" reminder."""
+    ev = json.load(sys.stdin)
+    record(ev)
+    event = ev.get("hook_event_name")
+    ask_phone = {"PreToolUse": ask, "PermissionRequest": approve}.get(event)
+    if ask_phone and (event != "PreToolUse" or ev.get("tool_name") == "AskUserQuestion"):
+        with contextlib.redirect_stdout(sys.stderr):  # only the decision JSON may reach stdout
+            decision = ask_phone(ev)
+        if decision:
+            print(json.dumps(decision))
+        return
+    if event not in ("Stop", "Notification"):
+        return
+    message, s = ev.get("message") or "", session(ev.get("session_id") or "")
+    if event == "Notification" and (ev.get("notification_type") == "idle_prompt" or "waiting for your input" in message):
+        return  # Claude Code says this a minute after every reply; the "finished" report already did
+    took = time.time() - s["started"] if s.get("started") else 0
+    if event == "Stop" and took < 60 and idle() < 60:
+        return  # a quick reply while you're at the Mac: you're watching it
+    name = esc(project(ev))
+    reply, title = transcript(ev.get("transcript_path"))
+    sub = f"\n<i>{esc(title)}</i>" if title else ""
+    if event == "Notification":  # permission prompts and the like: the task is stuck until someone answers
+        tg_send(f"⏳ <b>{name}</b> · waiting for you{sub}\n\n{esc(message or 'Claude is waiting for you')}")
+        return
+    head = f"✅ <b>{name}</b> · finished" + (f" in {duration(took)}" if took else "") + sub
+    if private(ev.get("cwd")):  # ~/.ccs-no-send folders: Claude's reply and screenshots stay on the Mac
+        tg_send(f"{head}\n\nThe reply and screenshots stay on the Mac: this folder is in ~/.ccs-no-send.")
+        return
+    # files written in this task get 📎 buttons, if the rules allow sending them
+    buttons = [file_button(s["id"], s["files"].index(p), p) for p in s["turn"] if not why_not(p)][:6]
+    # the reply sits in a collapsed quote: one tap expands it; plain text if Telegram rejects the formatting
+    if not reply or tg_send(f"{head}\n<blockquote expandable>{md_html(clip(reply, 2800))}</blockquote>", buttons) is False:
+        tg_send(head + (f"\n\n{esc(clip(reply, 1500))}" if reply else ""), buttons)
+    cfg = kc_get(TG, "bot")
+    send_images(cfg, ev)
+    send_made(cfg, s, reply)
+
+
+def main(argv):
+    cmd, *rest = argv or ["ls"]
+    opt = lambda name, default: float(rest[rest.index(name) + 1]) if name in rest else default
+    if cmd == "ls":
+        ls()
+    elif cmd == "json":
+        as_json()
+    elif cmd == "use" and rest:
+        use(pick(rest[0]))
+    elif cmd == "auto":
+        auto(opt("--ask", 90), opt("--at", 95), opt("--every", 120), "--once" in rest)
+    elif cmd == "tg":
+        tg_setup() if rest[:1] == ["setup"] else tg_loop()
+    elif cmd == "hook":
+        hook()
+    elif cmd == "rm" and rest:
+        k = pick(rest[0])
+        if k == sync():
+            sys.exit("That account is active; switch to another one first.")
+        subprocess.run(["security", "delete-generic-password", "-s", STORE, "-a", k], capture_output=True)
+        meta = load(META)
+        del meta[k]
+        save(META, meta)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
