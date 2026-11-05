@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="https://green-thunder.github.io/ccs/">Website</a> ·
+  <a href="https://green-thunder.github.io/claude-code-account-switcher/">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#menu-bar-app">Menu bar</a> ·
@@ -387,7 +387,7 @@ line="$line $(printf '\033[36m@%s\033[0m' "$account")"
 | `uz.ccs.telegram.plist` | Telegram bot (always running) | `~/Library/LaunchAgents/` |
 | `uz.ccs.menubar.plist` | starts the menu bar app at login | `~/Library/LaunchAgents/` |
 | `test_ccs.py` | test (never touches your real login) | — |
-| `docs/` | the screenshots and the website ([GitHub Pages](https://green-thunder.github.io/ccs/)) | — |
+| `docs/` | the screenshots and the website ([GitHub Pages](https://green-thunder.github.io/claude-code-account-switcher/)) | — |
 
 `ccs` keeps its data in these places:
 
